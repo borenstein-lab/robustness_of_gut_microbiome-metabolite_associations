@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.html
+.Rproj
+
+Analysis_Notebook_files/
+Analysis_Notebook_cache/
+README.html
+code/Analysis_Notebook.html

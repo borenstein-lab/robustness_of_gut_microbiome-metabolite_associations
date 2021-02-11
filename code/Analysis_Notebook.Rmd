@@ -1,0 +1,1658 @@
+---
+title: "Analysis Notebook: A meta-analysis study of the universality of gut microbiome-metabolome associations"
+output:
+  html_document:
+    css: Custom_Formatting.css
+    toc: true
+    toc_depth: 3
+    df_print: paged
+---
+
+## 0. Preparations
+
+R version: 3.6.1 (2019-07-05)
+
+```{r PREPARATIONS, message=FALSE}
+# Machine learning packages
+library(ranger) # Fast implementation of Random Forests, Version 0.12.1
+library(compositions) # Version 1.40-5
+library(tidymodels) # Version 0.1.0  
+
+# Files I/O packages
+library(gdata) # Version 2.18.0
+library(readr) # Version 1.3.1
+
+# Data visualization packages
+library(RColorBrewer) # Version 1.1-2
+library(viridis) # Version 0.5.1 
+library(ggplot2) # Version 3.2.1 
+library(cowplot) # Version 1.0.0
+library(kableExtra) # Version 1.1.0
+library(grid) # Version 3.6.1
+library(gridExtra) # Version 2.3 
+library(ggsignif) # Version 0.6.0 
+library(pheatmap) # Version 1.0.12
+library(dendextend) # Version 1.12.0
+library(corrgram) # Version 1.13 
+
+# Misc. packages / utilities
+library(tictoc) # Track runtimes, Version 1.0 
+library(DescTools) # FisherZInv function, Version 0.99.31 
+library(Hmisc) # Version 4.3-0
+library(weights) # Weighted correlation, Version 1.0.1 
+library(vegan) # Scaling: decostand, Version 2.5-6 
+source("Utilities.R")
+
+# For parallel processing
+library(doParallel) # Version 1.0.15 
+library(foreach) # Version 1.5.0   
+all_cores <- parallel::detectCores(logical = FALSE)
+registerDoParallel(cores = all_cores)
+
+# Meta-analysis
+library(meta) # Version 4.9-9
+library(metafor) # Version 2.1-0
+# Sub-group meta-analysis function adapted from from dmetar package
+source("Subgroup_Meta-Analysis_Mixed_Effects.R")
+
+options(scipen=999)
+ggplot2::theme_set(theme_light())
+knitr::opts_chunk$set(fig.align = 'center', cache=TRUE)
+```
+
+## 1. Load data
+
+In this section we load the data from an RData file, downsample temporal datasets, and print some statistics.  
+
+The RData file includes:  
+* A table with statistics per processed dataset   
+* Genera abundances per dataset   
+* Metabolite levels per dataset  
+* Metabolite mappings/metadata per dataset  
+* Subject metadata per dataset  
+
+Notes about data processing are available in the manuscript's supplementary information.
+
+```{r LOAD_DATA}
+load("../data/Processed_Data_Backup_29092020.RData")
+message("Data loaded")
+```
+
+### Downsample temporal datasets
+
+To better leverage the longitudinal datasets without causing biases in our ML models, we randomly choose up to 3 samples per subject, in every temporal dataset we have. This way we assure no single subject has a unproportional effect on the trained model. (Still, for testing we always take 1 sample per subject).
+
+```{r DOWNSAMPLE_TEMPORAL_DATASETS}
+# Choose temporal datasets that need downsampling
+# Note: I ignore datasets that do not have enough samples to begin with
+datasets.summary <- datasets.summary %>%
+  mutate(N.samples.original = datasets.summary$N.samples) %>%
+  mutate(N.subjects = -1)
+datasets.to.downsample <- c("POYET_BIO_ML_HEALTHY",
+                            "iHMP_IBD_HEALTHY",
+                            "iHMP_IBD_DISEASE",
+                            "MARS_IBS_HEALTHY",
+                            "MARS_IBS_DISEASE")
+
+# Iterate over datasets
+for(dataset in datasets.to.downsample) {
+  # Get a reproducible list of samples per subject
+  samples.to.keep <- downsample.by.subject(dataset, metadatas, genera.trans)
+  # Update data tables (microbiome + metabolome)
+  for(tmp.trans in names(genera.trans)) {
+    genera.trans[[tmp.trans]][[dataset]] <- 
+      genera.trans[[tmp.trans]][[dataset]][,samples.to.keep]
+  }
+  for(tmp.trans in names(mtb.trans)) {
+    mtb.trans[[tmp.trans]][[dataset]] <- 
+      mtb.trans[[tmp.trans]][[dataset]][,samples.to.keep]
+  }
+  # Update table with summary stats per dataset
+  datasets.summary$N.samples[datasets.summary$Dataset == dataset] <- 
+    length(samples.to.keep)
+  datasets.summary$N.subjects[datasets.summary$Dataset == dataset] <- 
+    n_distinct(metadatas[[dataset]] %>% 
+                 filter(Sample %in% samples.to.keep) %>% 
+                 pull(Subject.ID))
+}
+
+message("Downsampled temporal datasets")
+rm(tmp.trans, dataset, samples.to.keep, datasets.to.downsample)
+```
+
+### Choose datasets
+
+```{r}
+datasets.to.train.healthy <- c("FRANZOSA_IBD_HEALTHY",
+                       "YACHIDA_CRC_HEALTHY", 
+                       "KIM_ADENOMAS_HEALTHY", 
+                       "JACOBS_IBD_RELATIVES_HEALTHY",
+                       "HE_INFANTS_HEALTHY",
+                       "SINHA_CRC_HEALTHY",
+                       "POYET_BIO_ML_HEALTHY",
+                       "iHMP_IBD_HEALTHY",
+                       "MARS_IBS_HEALTHY")
+
+datasets.to.train.disease <- c("SINHA_CRC_DISEASE",
+                               "KIM_ADENOMAS_DISEASE", 
+                               #"HOFFMAN_CF_DISEASE",
+                               "YACHIDA_CRC_DISEASE", 
+                               "ERAWIJANTARI_GC_DISEASE",
+                               "FRANZOSA_IBD_DISEASE",
+                               "MARS_IBS_DISEASE",
+                               "iHMP_IBD_DISEASE")
+
+datasets.to.train <- 
+  c(datasets.to.train.healthy, datasets.to.train.disease)
+
+# Create a mapping from dataset subset name to original dataset name
+# (e.g. map both "MARS_IBS_HEALTHY" and "MARS_IBS_DISEASE" to "MARS_IBS")
+datasets.map.to.orig <- subset.to.orig.dataset[datasets.to.train]
+names(datasets.map.to.orig) <- datasets.to.train
+  
+print("Working on datasets:")
+print(datasets.to.train)
+```
+
+### Datasets summary - healthy + disease
+
+```{r}
+# ----------------- Organize and print statistics ------------------>
+tmp <- datasets.summary %>% 
+  filter(Dataset %in% datasets.to.train) 
+
+tmp %>% 
+  select(-Dataset.subset, -Dataset.Original, -Raw.Seq.Depth, -N.metabolites, -N.KEGG.metabolites, -N.samples.original, -Longitudinal, -N.genera) %>%
+  kable() %>%
+  kable_styling()
+
+tmp <- tmp %>%
+  mutate(N.subjects2 = ifelse(N.subjects > -1, N.subjects, N.samples))
+
+print(paste("Overall, we use data from", 
+            n_distinct(tmp$Dataset.Original),
+            "studies, including",
+            sum(tmp$N.samples[tmp$Dataset.subset == "Healthy"]), 
+            "samples from",
+            sum(tmp$N.subjects2[tmp$Dataset.subset == "Healthy"]), "'healthy' subjects, and",
+            sum(tmp$N.samples[tmp$Dataset.subset != "Healthy"]), 
+            "samples from",
+            sum(tmp$N.subjects2[tmp$Dataset.subset != "Healthy"]), "'case' subjects"))
+
+rm(tmp)
+```
+
+### Analyze feature overlap in healthy datasets
+
+We analyze the overlap in features across datasets.  
+Notably, we only consider features that pass our filters (prevalant over a threshold in the healthy cohort, annotated at genus level / HMDB annotated, etc.). This means that the number of features is also affected by the number of samples in the dataset (and not only technical aspects such as sequencing depth or metabolomics platform).
+
+```{r CHECK_OVERLAP_OF_FEATURES, fig.width=8, fig.height=7.2}
+# ------------------- Place holder for results --------------------->
+feat.overlap.pairwise <- data.frame(stringsAsFactors = F)
+
+# -------------- Collect stats per pair of datasets ---------------->
+for (i in 1:(length(datasets.to.train.healthy)-1)) { #i=1
+  for (j in (i+1):length(datasets.to.train.healthy)) { #j=2
+    tmp.dataset.1 <- datasets.to.train.healthy[i]
+    tmp.dataset.2 <- datasets.to.train.healthy[j]
+    
+    for (feat.type in c("Microbes", "Metabolites")) { #feat.type = "Microbes"
+      
+      # Get list of available features per dataset
+      if (feat.type == "Microbes") {
+        tmp.feat.list.1 <- rownames(genera.trans$RELATIVE[[tmp.dataset.1]])
+        tmp.feat.list.2 <- rownames(genera.trans$RELATIVE[[tmp.dataset.2]])
+      } else {
+        tmp.feat.list.1 <- metab.mappings[[tmp.dataset.1]] %>%
+          filter(Compound %in% rownames(mtb.trans$LOG[[tmp.dataset.1]])) %>%
+          pull(HMDB) %>%
+          unique()
+        tmp.feat.list.2 <- metab.mappings[[tmp.dataset.2]] %>%
+          filter(Compound %in% rownames(mtb.trans$LOG[[tmp.dataset.2]])) %>%
+          pull(HMDB) %>%
+          unique()
+      }
+      
+      N.shared <- length(intersect(tmp.feat.list.1, tmp.feat.list.2))
+      N.non.shared <- length(setdiff(union(tmp.feat.list.1,tmp.feat.list.2), 
+                                     intersect(tmp.feat.list.1,tmp.feat.list.2)))
+      
+      feat.overlap.pairwise <- 
+        bind_rows(feat.overlap.pairwise,
+                  data.frame(Dataset.1 = ifelse(feat.type == "Microbes", 
+                                                tmp.dataset.1, tmp.dataset.2), 
+                             Dataset.2 = ifelse(feat.type == "Microbes", 
+                                                tmp.dataset.2, tmp.dataset.1), 
+                             Feature.Type = feat.type,
+                             Comparison.Category = 
+                               c(paste(feat.type,"shared",sep=": "),
+                                                                          
+                                 paste(feat.type,"non-shared",sep=": ")),
+                             Count = c(N.shared, N.non.shared)))
+    }
+  }
+}
+
+feat.overlap.pairwise <- feat.overlap.pairwise %>%
+  mutate(Dataset.1 = factor(Dataset.1, levels = datasets.to.train.healthy,
+                            labels = substr(datasets.to.train.healthy, 1, 2))) %>%
+  mutate(Dataset.2 = factor(Dataset.2, levels = datasets.to.train.healthy,
+                            labels = substr(datasets.to.train.healthy, 1, 2)))
+
+# ----------------------------- Plot ------------------------------->
+ggplot(feat.overlap.pairwise, 
+       aes(fill=Comparison.Category, y=Count, x=1.5)) + 
+  geom_bar(position="fill", stat="identity", color="black") +
+  facet_grid(Dataset.2 ~ Dataset.1, switch = "both") +
+  coord_polar(theta="y", start = 0) +
+  xlim(0.5, 2) +
+  theme_bw() +
+  ylab(NULL) +
+  xlab(NULL) +
+  ggtitle("How much do different datasets overlap in terms of \n available genera / metabolites?") +
+  scale_fill_manual(values = c("Microbes: non-shared" = "darkseagreen2",
+                               "Microbes: shared" = "darkgreen",
+                               "Metabolites: non-shared" = "azure2",
+                               "Metabolites: shared" = "dodgerblue4")) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid  = element_blank(),
+        panel.spacing = unit(0, "lines"),
+        plot.title = element_text(hjust = 0.5),
+        legend.title = element_blank(),
+        strip.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 10),
+        strip.text.y = element_text(angle = 180, hjust = 1, size = 10),
+        strip.background = element_blank(),
+        panel.border = element_blank())
+
+rm(i,j,feat.type,tmp.dataset.1,tmp.dataset.2,
+   tmp.feat.list.1,tmp.feat.list.2,N.shared,N.non.shared)
+```
+
+
+## 2. Analysis settings
+
+In this section we choose the specific metabolites to be analyzed and specific settings for the machine learning pipeline. We additionally print statistics regarding the prevalance of different metabolites and different genera among datasets included in the analysis.  
+
+### Choose metabolites
+
+Get list of HMDB ID's that are common to at least 3 of the above (distinct) datasets.  
+We also record exactly which HMDB ID's appears in each dataset. 
+
+```{r fig.width=4.5, fig.height=3}
+# ------ Compose a list of unique HMDB IDs from all datasets ------->
+# Initialize an empty table with column per dataset 
+metabolites.per.dataset <- data.frame(stringsAsFactors = F)
+
+for (dataset in datasets.to.train) {
+  # Fetch the dataset's metabolite mapping file
+  tmp <- metab.mappings[[dataset]]
+  
+  # Get all HMDB ID's in the dataset (after our pre-processing)
+  hmdb.metabs.in.dataset <- 
+    tmp$HMDB[as.character(tmp$Compound) %in% 
+               rownames(mtb.trans$NONE[[dataset]])]
+  
+  # Remove dups (metabolites may appear more than once)
+  hmdb.metabs.in.dataset <- unique(hmdb.metabs.in.dataset)
+  
+  # Add HMDBs to our table (if not in there already)
+  new.hmdb.metabs <- 
+    hmdb.metabs.in.dataset[! hmdb.metabs.in.dataset %in% 
+                             metabolites.per.dataset$HMDB]
+  
+  new.hmdb.metabs <- data.frame(HMDB = new.hmdb.metabs, stringsAsFactors = F)
+  metabolites.per.dataset <- bind_rows(metabolites.per.dataset, new.hmdb.metabs)
+  
+  # Mark that they appear in the current dataset
+  metabolites.per.dataset <- metabolites.per.dataset %>%
+    mutate(!!dataset := ifelse(HMDB %in% hmdb.metabs.in.dataset,
+                               TRUE, FALSE))
+}
+
+# Replace all NAs with FALSE
+metabolites.per.dataset[is.na(metabolites.per.dataset)] <- FALSE
+
+# Count for each metabolite how many datasets have it
+metabolites.per.dataset <- metabolites.per.dataset %>%
+  mutate(N.Datasets.Total = rowSums(.[-1])) %>%
+  mutate(N.Datasets.Healthy = rowSums(.[datasets.to.train.healthy])) %>%
+  mutate(N.Datasets.Distinct = -1)  # Place holder
+
+# Fill "N.Datasets.Distinct" column
+for(i in 1:nrow(metabolites.per.dataset)) {
+  tmp <- data.frame(orig.dataset = subset.to.orig.dataset[datasets.to.train],
+                    flag = unlist(metabolites.per.dataset[i, datasets.to.train]))
+  tmp <- tmp %>%
+    group_by(orig.dataset) %>%
+    summarise(flag.orig.dataset = max(flag), .groups = "drop")
+  metabolites.per.dataset[i, "N.Datasets.Distinct"] <- sum(tmp$flag.orig.dataset)
+}
+
+# ---------------------- Print/plot statistics --------------------->
+print(paste(nrow(metabolites.per.dataset),
+            "unique HMDB compound IDs were found across all datasets"))
+
+print(paste(nrow(metabolites.per.dataset %>% filter(N.Datasets.Healthy > 0)),
+            "unique HMDB compound IDs were found across all *healthy* datasets"))
+
+tmp <- metabolites.per.dataset %>%
+  filter(N.Datasets.Healthy > 0) %>%
+  group_by(N.Datasets.Healthy) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  arrange(-N.Datasets.Healthy) %>%
+  mutate(cum.N = cumsum(N))
+
+ggplot(tmp, aes(x = N.Datasets.Healthy, y = cum.N)) +
+  geom_bar(stat="identity", color='black',fill='azure2') +
+  theme_classic() +
+  ggtitle("How common are HMDB metabolites among (healthy) datasets?") +
+  ylab("No. of HMDB metabolites") +
+  xlab("No. of datasets") +
+  scale_x_continuous(breaks=c(2,4,6,8,10,12,14)) +
+  geom_text(aes(label=cum.N), vjust = -0.5, size = 3) +
+  #geom_text(aes(label=paste("N =",cum.N)), vjust = -0.5, size = 2.5) +
+  scale_y_continuous(limits = c(0, max(tmp$cum.N) + 20)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 10), 
+        axis.text.y = element_text(size = 7),
+        axis.title = element_text(size = 10))
+
+# Get a list of common HMDBs (those that appear in >=3 datasets)
+common.HMDBs <- metabolites.per.dataset %>%
+  filter(N.Datasets.Distinct >= 3) %>%
+  pull(HMDB)
+print(paste(length(common.HMDBs), "metabolites appear in >= 3 distinct datasets"))
+
+common.HMDBs.healthy <- metabolites.per.dataset %>%
+  filter(N.Datasets.Healthy >= 3) %>%
+  pull(HMDB)
+print(paste(length(common.HMDBs.healthy), "metabolites appear in >= 3 healthy datasets"))
+
+# ---------------------------- Clean up ---------------------------->
+rm(tmp, hmdb.metabs.in.dataset, dataset, new.hmdb.metabs, i)
+```
+
+### Annotate low-confidence metabolites 
+
+Add an annotation for metabolites that were not identified with high confidence in one or more of the studies. See supplementary information for further details.
+
+```{r}
+# Initialize tables to store relevant statistics
+metabolites.conf.flags <- data.frame(HMDB = common.HMDBs, 
+                                     Low.Confidence.Count = 0,
+                                     stringsAsFactors = F)
+metabolites.conf.flags.per.ds <- data.frame(Dataset = character(0), 
+                                      Compound = character(0), 
+                                      High.Confidence = logical(0), 
+                                      stringsAsFactors = F)
+
+# Iterate over datasets (original ones included in any of the analyses)
+for (dataset in unique(datasets.map.to.orig)) { 
+  tmp <- metab.mappings[[dataset]]
+  tmp <- tmp[! tmp$High.Confidence, ]
+  
+  # Update tables
+  metabolites.conf.flags <- metabolites.conf.flags %>%
+    mutate(Low.Confidence.Count = ifelse(HMDB %in% tmp$HMDB, 
+                                         Low.Confidence.Count+1, 
+                                         Low.Confidence.Count))
+  
+  metabolites.conf.flags.per.ds <- bind_rows(metabolites.conf.flags.per.ds,
+                                             tmp %>%
+                                               select(Compound, High.Confidence) %>%
+                                               mutate(Dataset = dataset))
+}
+
+print(paste("Out of the", 
+            nrow(metabolites.conf.flags),
+            "metabolites shared across 3 or more datasets,",
+            sum(metabolites.conf.flags$Low.Confidence.Count>0),
+            "metabolites are annotated with lower confidence flag"))
+
+rm(dataset, tmp)
+```
+
+### Analyze shared genera features
+
+```{r fig.width=4.5, fig.height=3}
+# --------------- Initialize table for genera statistics ----------->
+genera.dataset.stats <- data.frame(Taxon = character(0),
+                           Dataset = character(0),
+                           Dataset.N = integer(0),
+                           Taxon.Mean.Abundance = numeric(0),
+                           Taxon.Var.Abundance = numeric(0),
+                           Taxon.Perc.of.Non.Zeros = numeric(0),
+                           stringsAsFactors = FALSE)
+
+# We iterate over each dataset and record a few basic stats per each genus in each dataset
+for (dataset in datasets.to.train.healthy) {
+  tmp.genera <- rownames(genera.trans$RELATIVE[[dataset]])
+  tmp.means <- unname(apply(genera.trans$RELATIVE[[dataset]], MARGIN = 1, mean))
+  tmp.vars <- unname(apply(genera.trans$RELATIVE[[dataset]], MARGIN = 1, var))
+  tmp.non.zero.perc <- unname(apply(genera.trans$RELATIVE[[dataset]], 
+                                    MARGIN = 1, 
+                                    function(r) {100*sum(r>0)/length(r)}))
+  tmp <- data.frame(Taxon = tmp.genera, 
+                    Dataset = dataset,
+                    Dataset.N = ncol(genera.trans$RELATIVE[[dataset]]),
+                    Taxon.Mean.Abundance = tmp.means,
+                    Taxon.Var.Abundance = tmp.vars,
+                    Taxon.Perc.of.Non.Zeros = tmp.non.zero.perc,
+                    stringsAsFactors = FALSE)
+  genera.dataset.stats <- bind_rows(genera.dataset.stats, tmp)
+}
+
+# We further summarize these stats to get basic statistics at the genus level (average over datasets)
+genera.stats <- genera.dataset.stats %>%
+  group_by(Taxon) %>%
+  summarise(Taxon.Overall.Mean.Abundance = weighted.mean(x = Taxon.Mean.Abundance, 
+                                                         w = Dataset.N),
+            Taxon.Overall.Perc.Non.Zero = weighted.mean(x = Taxon.Perc.of.Non.Zeros, 
+                                                        w = Dataset.N),
+            N.Datasets.Including.Taxon = n(),
+            .groups = "drop") %>%
+  mutate(Genus.Only = gsub(".*\\|g__","g__", Taxon))
+
+# ---------------------- Print/plot statistics --------------------->
+print(paste(nrow(genera.stats),
+            "unique genera were found across all healthy datasets"))
+
+tmp <- genera.stats %>%
+  group_by(N.Datasets.Including.Taxon) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  arrange(-N.Datasets.Including.Taxon) %>%
+  mutate(cum.N = cumsum(N))
+
+ggplot(tmp, aes(x = N.Datasets.Including.Taxon, y = cum.N)) +
+  geom_bar(stat="identity", color='black', fill='azure2') +
+  theme_classic() +
+  ggtitle("How common are genera among datasets?") +
+  ylab("No. of genera") +
+  xlab("No. of datasets") +
+  scale_x_continuous(breaks=c(2,4,6,8,10,12,14)) +
+  #geom_text(aes(label=paste("N =",cum.N)), vjust = -0.5, size = 2.5) +
+  geom_text(aes(label=cum.N), vjust = -0.5, size = 3) +
+  scale_y_continuous(limits = c(0, max(tmp$cum.N) + 7)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+        axis.title = element_text(size = 10))
+
+# ---------------------------- Clean up ---------------------------->
+rm(dataset, tmp.genera, tmp.means, tmp.vars, tmp.non.zero.perc, tmp)
+```
+
+
+### Choose ML pipeline options
+
+LOOCV = Leave one out cross validation, LOSO = Leave one subject out.  
+
+```{r}
+param.tuning <- FALSE
+num.runs <- 5
+model.options <- c("RF") #c("ENet", "RF")
+genera.trans.options <- c("RELATIVE") #,"CLR")
+tuning.cv.k <- 10 # Folds for (inner) CV
+test.cv.k <- 0 # 0 for LOOCV / LOSO-CV # TODO: no support for >0 numbers at the moment (following LOSO support)
+
+message("Number of runs per task: ", num.runs)
+message("Model options: ", paste(model.options, collapse = ", "))
+message("Genera transformation options: ", paste(genera.trans.options, collapse = ", "))
+message("K for tuning cross-validation: ", tuning.cv.k)
+message("K for testing cross-validation (0 = LOOCV): ", test.cv.k)
+```
+
+## 3. Train regression machine learning models
+
+At this point we save an image with all R data thus far, to be used with the seperate R script that runs the entire machine learning pipeline (Machine_Learning_Pipeline_For_Condor.R). 
+
+```{r, eval = FALSE}
+save.image(file='data/Image_For_Condor.RData')
+```
+
+We then run the script with various settings (see documentation in script) and for each of the datasets. Finally all results are merged into a single table which we now load back into the main notebook.  
+Each line in the table represents a specific set of pipeline settings, a specific metabolite and a specific dataset. Furthermore, we execute each such task 5 times to also estimate results stability.   
+
+```{r ORGANIZE_RESULTS, message = FALSE}
+# Read if not exists already
+metab.pred.results <- read_delim("../data/Combined_Metabolome_Predictability_Results.tsv", 
+                                   "\t", escape_double = FALSE, trim_ws = TRUE)
+metab.pred.results <- metab.pred.results %>% 
+    filter(PipeSettings.Genera.Trans == "RELATIVE")
+
+# If results include datasets not selected above, remove
+metab.pred.results <- metab.pred.results %>%
+  filter(Task.Dataset %in% datasets.to.train) %>%
+  filter(Task.HMDB %in% common.HMDBs)
+
+# For metabolites that appeared more than once in a specific dataset (i.e. same HMDB appears more than once),
+#  we take only the raw-metabolite with best predictability (averaged over 5 runs).
+keep.these <- metab.pred.results %>%
+  # Group by task
+  group_by(Task.Dataset, 
+           Task.HMDB, 
+           Task.Metabolite.Raw, 
+           PipeSettings.Genera.Trans, 
+           PipeSettings.ML.Model, 
+           PipeSettings.Shuffled, 
+           PipeSettings.Tuning) %>%
+  # Get average performance
+  summarise(Avg.Spearman = mean(Test.CV.Spearman.rho), 
+            N = n(), .groups = "drop") %>%
+  # Group by dataset+HMDB
+  group_by(Task.Dataset, 
+           Task.HMDB, 
+           PipeSettings.Genera.Trans, 
+           PipeSettings.ML.Model, 
+           PipeSettings.Shuffled, 
+           PipeSettings.Tuning) %>%
+  # Take only best metabolite
+  slice(which.max(Avg.Spearman)) %>%
+  # Identifiers of which tasks to keep in the analysis
+  select(Task.Dataset, 
+         Task.HMDB,
+         Task.Metabolite.Raw, 
+         PipeSettings.Genera.Trans, 
+         PipeSettings.ML.Model, 
+         PipeSettings.Shuffled, 
+         PipeSettings.Tuning)
+  
+metab.pred.results <- metab.pred.results %>%
+  inner_join(keep.these)
+
+# Add HMDB-unified metabolite name 
+metab.pred.results <- metab.pred.results %>%
+  left_join(metabolite.stats %>% 
+              select(HMDB, Compound.Name), 
+            by = c("Task.HMDB" = "HMDB")) 
+
+rm(keep.these)
+```
+
+
+Now we create an additional summarized predictability table, with one row per pipeline setting + prediction task (i.e. dataset + hmdb), i.e. we average results over independent runs.  
+
+```{r}
+# Lastly, create a summarized version where metrics are averaged over runs
+metab.pred.results.sum <- metab.pred.results %>%
+  group_by(Task.Dataset, 
+           Task.Metabolite.Raw, 
+           Task.HMDB, 
+           Compound.Name, 
+           PipeSettings.Genera.Trans, 
+           PipeSettings.ML.Model, 
+           PipeSettings.Tuning, 
+           PipeSettings.Shuffled, 
+           N.Genera.Features, 
+           N.Train.Samples) %>%
+  summarise(Avg.Spearman = mean(Test.CV.Spearman.rho),
+            Var.Spearman = var(Test.CV.Spearman.rho),
+            Avg.Spearman.p = mean(Test.CV.Spearman.p),
+            Var.Spearman.p = var(Test.CV.Spearman.p),
+            Avg.Rsq = mean(Test.CV.RSq),
+            Var.Rsq = var(Test.CV.RSq),
+            .groups = 'drop') %>%
+  # Add full pipeline identifier
+  mutate(Pipe.ID = paste0("Trans'=", 
+                          PipeSettings.Genera.Trans,
+                          "~Model=",
+                          PipeSettings.ML.Model, 
+                          "~Tuning=",
+                          PipeSettings.Tuning, 
+                          "~Shuff'=",
+                          PipeSettings.Shuffled)) %>%
+  group_by(Pipe.ID, 
+           PipeSettings.Genera.Trans, 
+           PipeSettings.ML.Model, 
+           PipeSettings.Tuning, 
+           PipeSettings.Shuffled, 
+           Task.Dataset) %>%
+  mutate(Avg.Spearman.FDR = p.adjust(Avg.Spearman.p, method = "fdr")) %>%
+  mutate(Healthy = grepl("HEALTHY", Task.Dataset)) %>%
+  ungroup()
+```
+
+## 4. Compare pipelines  
+
+In this section we compare 4 different machine learning pipelines, in terms of how many well-performing models have they produced and in terms of stability over independent runs with the exact same settings.  
+For consistency with downstream analysis, we only look at the metabolite in the common.HMDBs.healthy list (even though we actually have additional predictors for any common metabolite, considering disease datasets as well).  
+```{r PIPELINE_COMPARISON_PREPS}
+# For plotting - pretty names for pipeline settings
+map.pipe.names <- c("Trans'=RELATIVE~Model=ENet~Tuning=FALSE~Shuff'=FALSE" = 
+                      "Enet without tuning",
+                    "Trans'=RELATIVE~Model=ENet~Tuning=TRUE~Shuff'=FALSE" = 
+                      "ENet with tuning",
+                    "Trans'=RELATIVE~Model=RF~Tuning=FALSE~Shuff'=FALSE" = 
+                      "RF without tuning",
+                    "Trans'=RELATIVE~Model=RF~Tuning=TRUE~Shuff'=FALSE" = 
+                      "RF with tuning",
+                    "Trans'=RELATIVE~Model=ENet~Tuning=FALSE~Shuff'=TRUE" = 
+                      "Enet without tuning - SHUFFLED",
+                    "Trans'=RELATIVE~Model=ENet~Tuning=TRUE~Shuff'=TRUE" = 
+                      "ENet with tuning - SHUFFLED",
+                    "Trans'=RELATIVE~Model=RF~Tuning=FALSE~Shuff'=TRUE" = 
+                      "RF without tuning - SHUFFLED",
+                    "Trans'=RELATIVE~Model=RF~Tuning=TRUE~Shuff'=TRUE" = 
+                      "RF with tuning - SHUFFLED")
+
+pipe.colors <- c("Enet without tuning" = "#723d46",
+                 "ENet with tuning" = "#e26d5c",
+                 "RF without tuning" = "#c9cba3",
+                 "RF with tuning" = "#ffe1a8")
+```
+
+### Number of well predicted metabolites
+
+Per dataset, which method results in the highest number of well-predicted metabolites? (see manuscript for 'well-predicted metabolite' definition)
+
+
+```{r WP_DEFINITION}
+rho.threshold <- 0.3
+fdr.threshold <- 0.1
+message("Rho threshold: ", rho.threshold)
+message("FDR value threshold: ", fdr.threshold)
+```
+
+
+```{r COMPARE_PIPES1, fig.height=6, fig.width=9.5}
+tmp <- metab.pred.results.sum %>%
+  filter(! PipeSettings.Shuffled) %>%
+  filter(Task.HMDB %in% common.HMDBs.healthy) %>%
+  group_by(Pipe.ID, Task.Dataset) %>%
+  summarise(N.metabolites = n(),
+            Spearman.above.0.3 = sum(Avg.Spearman > rho.threshold),
+            Spearman.above.0.3.FDR.below.0.1 = sum(Avg.Spearman > rho.threshold & Avg.Spearman.FDR < fdr.threshold),
+            .groups = "drop") %>%
+  mutate(Percent.well.predicted = Spearman.above.0.3.FDR.below.0.1 * 100 / N.metabolites) %>%
+  mutate(Pretty.Pipe.ID = map.pipe.names[Pipe.ID]) %>%
+  arrange(Task.Dataset)
+
+ggplot(tmp, aes(x = Pretty.Pipe.ID, fill = Pretty.Pipe.ID, y = Percent.well.predicted)) +
+  geom_bar(stat = "identity", color = "black") +
+  ylab("% of well-predicted metabolites in dataset") +
+  xlab(NULL) +
+  coord_flip() +
+  scale_fill_manual(values = pipe.colors) +
+  theme_classic() +
+  facet_wrap(~ Task.Dataset, nrow = 4) +
+  theme(legend.position = "none",
+        axis.text.y = element_text(size = 9), 
+        strip.text = element_text(size = 7.5, hjust = 0))
+
+rm(tmp)
+```
+
+Further summing over (healthy) datasets: which method results in most well-predicted-at-least-once?    
+We print statistics per pipeline.  
+
+```{r COMPARE_PIPES2}
+metab.pred.results.sum %>%
+  filter(Healthy) %>%
+  filter(Task.HMDB %in% common.HMDBs.healthy) %>%
+  group_by(Pipe.ID, Task.HMDB) %>%
+  summarise(N.datasets = n(),
+            Spearman.above.0.3.P.below.0.1 = 
+              sum(Avg.Spearman > rho.threshold & Avg.Spearman.FDR < fdr.threshold), .groups = "drop") %>%
+  mutate(Pipe.ID.2 = map.pipe.names[Pipe.ID]) %>%
+  group_by(Pipe.ID.2) %>%
+  summarise(Never.well.predicted = sum(Spearman.above.0.3.P.below.0.1 == 0),
+            Well.predicted.once.or.more = sum(Spearman.above.0.3.P.below.0.1 >= 1), 
+            .groups = "drop") %>%
+  kable() %>%
+  kable_styling()
+```
+
+```{r COMPARE_PIPES3}
+metab.pred.results.sum %>%
+  filter(Healthy) %>%
+  filter(Task.HMDB %in% common.HMDBs.healthy) %>%
+  mutate(Pipe.ID.2 = map.pipe.names[Pipe.ID]) %>%
+  group_by(Pipe.ID.2) %>%
+  summarise(N.tasks = n(),
+            Spearman.above.0.3.P.below.0.1 = 
+              sum(Avg.Spearman > rho.threshold & Avg.Spearman.FDR < fdr.threshold), 
+            .groups = "drop") %>%
+  kable() %>%
+  kable_styling()
+```
+
+### Pipeline stability & predictive power
+
+Here we examine (1) pipeline stability, i.e. how stable are results over independent runs (measured by variance in performance metrics), and (2) predictive power, measured by Spearman's correlation.  
+
+Note: not all models have a random element, so if LOOCV is used, no variance should be expected at all.
+
+Here: not limited to common.HMDBs.healthy.
+
+```{r COMPARE_PIPES4, fig.height=3.5, fig.width=5.2}
+# Stability comparison using variance in Spearman rho
+metab.pred.results.sum %>%
+  filter(! PipeSettings.Shuffled) %>%
+  mutate(Pretty.Pipe.ID = map.pipe.names[Pipe.ID]) %>%
+  ggplot(aes(x = Pretty.Pipe.ID, fill = Pretty.Pipe.ID, y = Var.Spearman)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.1, fill = "white") +
+  scale_fill_manual(values = pipe.colors) +
+  ylab("Variance in Spearman rho\n---> Higher values = less stable results") + #\n(across independent identical runs)
+  xlab(NULL) +
+  ggtitle("Comaprison of pipeline \"stability\" -\nSpearman's rho variance") +
+  labs(fill = "Pipeline settings") +
+  theme(axis.text.x = element_blank())
+
+# Predictive power comparison using average Spearman rho
+metab.pred.results.sum %>%
+  filter(! PipeSettings.Shuffled) %>%
+  mutate(Pretty.Pipe.ID = map.pipe.names[Pipe.ID]) %>%
+  ggplot(aes(x = Pretty.Pipe.ID, fill = Pretty.Pipe.ID, y = Avg.Spearman)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.1, fill = "white") +
+  scale_fill_manual(values = pipe.colors) +
+  ylab("Average Spearman rho\n---> Higher values = more predictive power") + #\n(across independent identical runs)
+  xlab(NULL) +
+  ggtitle("Comaprison of pipeline \"predictive power\" -\nSpearman's rho") +
+  labs(fill = "Pipeline settings") +
+  theme(axis.text.x = element_blank())
+```
+
+Stability statistics.  
+WP = well-predicted.  
+Borderline = 1 of 5 runs not well-predicted / 1 of 5 runs well-predicted.  
+
+```{r COMPARE_PIPES5, fig.width=4, fig.height=4}
+metab.pred.results %>% 
+  # Choose a specific pipeline
+  filter(PipeSettings.Genera.Trans == "RELATIVE" &
+           (! PipeSettings.Shuffled)) %>% 
+  filter(Task.HMDB %in% common.HMDBs.healthy) %>%
+  filter(Task.Dataset %in% datasets.to.train.healthy) %>%
+  select(PipeSettings.ML.Model, PipeSettings.Tuning, Task.HMDB, Compound.Name, Task.Dataset, Test.CV.Spearman.rho, Test.CV.Spearman.p) %>%
+  mutate(Well.predicted.in.run = (Test.CV.Spearman.rho > rho.threshold & Test.CV.Spearman.p < 0.1)) %>%
+  group_by(PipeSettings.ML.Model, PipeSettings.Tuning, Task.HMDB, Compound.Name, Task.Dataset) %>%
+  summarise(No.WP.of.5 = sum(Well.predicted.in.run), .groups="drop") %>%
+  group_by(PipeSettings.ML.Model, PipeSettings.Tuning) %>%
+  summarise(N = n(),
+            N.always.WP = sum(No.WP.of.5 == 5),
+            N.never.WP = sum(No.WP.of.5 == 0),
+            N.borderline = sum(No.WP.of.5 %in% c(1,4)),
+            .groups="drop") %>%
+  mutate(N.full.agreement = N.always.WP+N.never.WP) %>%
+  mutate(Perc.always.WP = round(100*N.always.WP/N,2)) %>%
+  mutate(Perc.never.WP = round(100*N.never.WP/N,2)) %>%
+  mutate(Perc.full.agreement = Perc.always.WP+Perc.never.WP) %>%
+  mutate(Perc.full.agree.or.borderline = Perc.full.agreement+round(100*N.borderline/N,2)) %>%
+  kable() %>%
+  kable_styling()
+```
+
+## 5. Predicatability analysis - healthy only
+
+In this section we focus on a single machine learning pipeline, find well-predicted metabolites and compare different datasets.  
+
+### Choose a pipeline 
+
+```{r}
+chosen.pipe <- "Trans'=RELATIVE~Model=RF~Tuning=FALSE~Shuff'=FALSE"
+chosen.ML.model <- "RF"
+chosen.tuning <- FALSE
+message("Chose pipeline: ", chosen.pipe)
+```
+
+### Compare to shuffled data
+
+Here we want to show that the portion of well-predicted metabolites is not just a data artefact by comparing to results of an identical pipeline but with shuffling of metabolite values per model.
+
+```{r}
+tmp <- metab.pred.results.sum %>%
+  filter(PipeSettings.ML.Model == chosen.ML.model) %>%
+  filter(PipeSettings.Tuning == chosen.tuning) %>%
+  filter(Healthy) %>%
+  group_by(PipeSettings.Shuffled, Task.Dataset) %>%
+  summarise(N.tasks = n(),
+            N.well.predicted = sum(Avg.Spearman > rho.threshold & 
+                                     Avg.Spearman.FDR < fdr.threshold),
+            .groups = "drop") %>%
+  mutate(Percent.well.predicted = round(100*N.well.predicted/N.tasks, 3)) %>%
+  mutate(PipeSettings.Shuffled = ifelse(PipeSettings.Shuffled, "Shuffled", "Original")) %>%
+  tidyr::pivot_wider(names_from = PipeSettings.Shuffled, values_from = c(N.well.predicted, Percent.well.predicted)) 
+
+tmp %>%
+  kable() %>%
+  kable_styling()
+
+print(paste("On average,", round(mean(tmp$Percent.well.predicted_Original), 2),
+            "percent of metabolites per dataset came out well predicted, compared to",
+            round(mean(tmp$Percent.well.predicted_Shuffled), 2), 
+            "percent when metabolite values were shuffled. Percentiles:"))
+
+quantile(x = tmp$Percent.well.predicted_Original)
+quantile(x = tmp$Percent.well.predicted_Shuffled)
+
+rm(tmp)
+```
+
+For convenience, we split the main predictability results table into a version including only healthy datasets, only disease datasets, and all.  
+
+```{r}
+metab.pred.results.all <- metab.pred.results.sum %>%
+  filter(Task.Dataset %in% datasets.to.train) %>%
+  filter(Pipe.ID == chosen.pipe)
+
+metab.pred.results.dis <- metab.pred.results.sum %>%
+  filter(Task.Dataset %in% datasets.to.train) %>%
+  filter(Pipe.ID == chosen.pipe) %>%
+  filter(!Healthy)
+
+metab.pred.results.sum <- metab.pred.results.sum %>%
+  filter(Task.Dataset %in% datasets.to.train) %>%
+  filter(Pipe.ID == chosen.pipe) %>%
+  filter(Healthy)
+```
+
+### Statistics per metabolite
+
+Aggregate statistics per metabolite:
+
+```{r STATS_PER_METAB}
+pred.per.metabolite <- metab.pred.results.sum %>%
+  # Include only metabolites "common" in healthy datasets
+  filter(Task.HMDB %in% common.HMDBs.healthy) %>%
+  # Summarize stats per metabolite
+  group_by(Task.HMDB, Compound.Name) %>%
+  summarise(N.Datasets = n_distinct(Task.Dataset),
+            Max.Rho = max(Avg.Spearman),
+            Min.Rho = min(Avg.Spearman),
+            Count.Well.Predicted = 
+              sum(Avg.Spearman > rho.threshold & 
+                    Avg.Spearman.FDR < fdr.threshold),
+            .groups = "drop") %>%
+  mutate(Perc.Well.Predicted = 
+           round(100*Count.Well.Predicted/N.Datasets, 2)) %>%
+  # Add all metabolite stats from HMDB
+  left_join(metabolite.stats %>% select(-Compound.Name), 
+            by = c("Task.HMDB" = "HMDB")) %>%
+  # Order by number of datasets well-predicted in
+  arrange(-Count.Well.Predicted)
+```
+
+Print summarized statistics.  
+
+```{r STATS_PER_METAB2}
+print(paste("Overall,", 
+            sum(pred.per.metabolite$N.Datasets), 
+            "metabolite-predictors were trained, covering",
+            nrow(pred.per.metabolite), 
+            "metabolites in",
+            length(datasets.to.train.healthy), 
+            "datasets"))
+print(paste("Of these,", 
+      sum(pred.per.metabolite$Count.Well.Predicted),
+      "metabolite-predictors resulted in a Spearman correlation of >",rho.threshold,"and",
+      "FDR value < 0.1, using loo cross validation"))
+print(paste(sum(pred.per.metabolite$Count.Well.Predicted > 0),
+            "metabolites were well-predicted by the above definition at least once, while",
+            sum(pred.per.metabolite$Count.Well.Predicted == 0),
+            "were never well predicted using our pipeline"))
+
+print(paste("Moreover,", sum(pred.per.metabolite$Count.Well.Predicted > 1),
+            "metabolites were well-predicted twice or more,",
+            sum(pred.per.metabolite$Count.Well.Predicted > 2),
+            "metabolites were well-predicted 3 times or more, and",
+            sum(pred.per.metabolite$Count.Well.Predicted > 3),
+            "metabolites were well-predicted 4 times or more."))
+```
+
+### Statistics per healthy dataset
+
+Note: sample counts are those after our processing, including the downsampling of longitudinal datasets.  
+
+```{r STATS_PER_DATASET, fig.height=3.4, fig.width=4.8}
+# --------------------- Preparations for plots --------------------->
+# For plotting purposes we will sort the datasets by number of healthy samples 
+tmp <- datasets.summary %>%
+  filter(Dataset.subset == "Healthy") %>%
+  filter(Dataset %in% 
+           unique(metab.pred.results.sum$Task.Dataset)) %>%
+  mutate(N.samples = as.numeric(N.samples)) %>%
+  arrange(N.samples)
+
+tmp.metab.pred.results.sum <-
+  metab.pred.results.sum %>%
+  inner_join(tmp %>% select(Dataset, Dataset.Original), 
+             by = c("Task.Dataset" = "Dataset")) %>%
+  mutate(Dataset.Original = 
+           factor(Dataset.Original, 
+                  levels=tmp$Dataset.Original))
+
+healthy.datasets.order4plot <- unique(tmp$Dataset) # Keep for the next chunks
+
+# ---------------- Plot 1: sample size per dataset ----------------->
+# Create thin table with HC/full dataset sizes
+tmp2 <- tmp %>%
+  select(Dataset.Original, N.samples) %>%
+  rename(N.samples.hc = N.samples) %>%
+  left_join(datasets.summary %>% 
+              filter(Dataset.subset != "All") %>% 
+              group_by(Dataset.Original) %>%
+              summarise(N.samples = sum(N.samples), .groups = "drop"),
+             by = "Dataset.Original") %>%
+  # Ordering for plot - by num of hc
+  mutate(Dataset.Original = 
+           factor(Dataset.Original, levels=tmp$Dataset.Original, 
+                                   labels=substr(tmp$Dataset.Original,1,2))) %>%
+  mutate(N.samples2 = ifelse(is.na(N.samples), 
+                             N.samples.hc, 
+                             N.samples)) %>%
+  mutate(N.samples.label = paste0(" ",
+                                  N.samples2,
+                                  "\n (H=",
+                                  N.samples.hc,")"))
+
+tmp.dataset.colors <- 
+  dataset.colors[names(dataset.colors) %in% 
+                   datasets.to.train.healthy]
+names(tmp.dataset.colors) <- 
+  substr(names(tmp.dataset.colors),1,2)
+
+p1 <- ggplot(tmp2, aes(x=Dataset.Original, y=N.samples2)) +
+  geom_bar(stat="identity", color="black", fill = "grey80") +
+  geom_text(aes(label=N.samples.label),
+            vjust=0.5,hjust=0,size=2.8) +
+  geom_bar(aes(y=N.samples.hc, fill=Dataset.Original), 
+           stat="identity", color="black") +
+  scale_y_continuous(expand = c(0, 0, 0.35, 0)) +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_manual(values = tmp.dataset.colors) +
+  xlab("Dataset") +
+  ylab("# samples\n") +
+  theme(legend.position = "none",
+        plot.margin = unit(c(5.5,6.5,7.8,5.5), "points"),
+        axis.text.y = element_text(size = 9),
+        panel.grid.major.x = 
+          element_line(size = 0.5, color = "grey93"),
+        axis.title.y = element_text(size = 12))
+
+# ---- Plot 2: Number of well-predicted metabolites per dataset ---->
+tmp2 <- tmp.metab.pred.results.sum %>%
+  group_by(Dataset.Original) %>% 
+  summarise(N.well.predicted = sum(Avg.Spearman > rho.threshold & Avg.Spearman.FDR < fdr.threshold),
+            N = n(), .groups = "drop") %>%
+  mutate(Perc.well.predicted = 100*N.well.predicted/N) %>%
+  mutate(Perc.well.predicted2 = paste0(round(Perc.well.predicted),'%'))
+
+print(paste("In each dataset,", min(round(tmp2$Perc.well.predicted)), '-', max(round(tmp2$Perc.well.predicted)), '% of metabolites analyzed were well-predicted'))
+
+p2 <- ggplot(tmp2, aes(x=Dataset.Original, fill=Dataset.Original)) +
+  geom_segment(aes(x = Dataset.Original, y = 0, 
+                   xend = Dataset.Original, yend = N.well.predicted)) +
+  geom_point(aes(y=N.well.predicted), shape=23, color="black", size=6) +
+  geom_point(aes(y=N),shape=18,color="black", size=4) +
+  geom_text(aes(label=Perc.well.predicted2, 
+                y=ifelse(N<50, N+21, N.well.predicted+23)), 
+            vjust=0.5, hjust=0, size=3) +
+  scale_y_continuous(expand = c(0, 0, 0.15, 0)) +
+                     # trans = log10_trans(),
+                     # breaks = trans_breaks("log10", inv = function(x) 10^x, n = 5),
+                     # labels = trans_format("log10", math_format(10^.x))) +
+  expand_limits(y = 0) +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_manual(values = dataset.colors) +
+  xlab(NULL) +
+  ylab("# well-predicted\nmetabolites") +
+  scale_size_manual(values = c(5, 3)) +
+  theme(legend.position = "none", 
+        plot.margin = unit(c(5.5,5.5,7.5,5.5), "points"),
+        panel.grid.major.x = element_line(size = 0.5, color = "grey93"),
+        axis.text.y = element_blank()) 
+
+grid.arrange(p1, p2, nrow = 1, widths = c(0.56, 0.44)) 
+
+# Clean up
+rm(tmp, tmp2, p1, p2, tmp.metab.pred.results.sum, tmp.dataset.colors)
+```
+
+
+Distribution of number of times well predicted.
+
+```{r fig.width=4.6, fig.height=3.4}
+ggplot(pred.per.metabolite %>%
+         mutate(Count.Well.Predicted = 
+                  as.character(Count.Well.Predicted)) %>%
+         group_by(Count.Well.Predicted, N.Datasets) %>%
+         summarise(N.metabolites = n(), .groups = "drop"),
+       aes(x = N.Datasets, y = N.metabolites, fill = Count.Well.Predicted)) +
+  geom_bar(stat = "identity", position="stack", 
+           color = "black", width=0.85) +
+  scale_fill_brewer(palette = "Greys",
+                    guide = guide_legend(title = "Datasets well-\npredicted in", 
+                                         keywidth = 1.5, 
+                                         keyheight = 0.8)) +
+  scale_y_continuous(expand = c(0, 0, 0.05, 0)) +
+  theme_classic() +
+  xlab("Number of datasets including the metabolite") +
+  ylab("Number of metabolites") + 
+  theme(legend.position = c(0.86, 0.7),
+        axis.title.y = element_text(size = 12))
+```
+
+### Predictability heatmaps
+
+Plot agreement in predictability between different datasets. First prepare a temporary table for all plots.
+
+```{r}
+tmp <- metab.pred.results.sum %>%
+  mutate(Task.Dataset2 = datasets.map.to.orig[Task.Dataset]) %>%
+  mutate(Task.Dataset2 = factor(Task.Dataset2, 
+                                levels = unname(datasets.map.to.orig[healthy.datasets.order4plot]),
+                                labels = substr(unname(datasets.map.to.orig[healthy.datasets.order4plot]),1,2))) %>%
+  mutate(Spearman.bin = cut(Avg.Spearman, 
+                            c(-1, 0.3, 0.4, 0.5, 0.6, 1), 
+                            right = F)) %>%
+  mutate(Spearman.bin = 
+           plyr::revalue(Spearman.bin, 
+                         c("[-1,0.3)"="< 0.3", 
+                           "[0.6,1)"="> 0.6"))) %>%
+  mutate(Significance = get.signif.marks(Avg.Spearman.FDR)) %>%
+  mutate(Significance = ifelse(Significance=="^","",Significance))
+```
+
+
+Metabolites that came out well-predicted 3/4 or more times:
+
+```{r PRED_ACROSS_DATASETS, fig.width=7.6, fig.height=4.5}
+HMDBs.to.include <- pred.per.metabolite %>%
+  filter(Count.Well.Predicted >= 4) %>%
+  pull(Task.HMDB)
+
+p <- tmp %>%
+  filter(Task.HMDB %in% HMDBs.to.include) %>%
+  tidyr::complete(Task.Dataset2, Compound.Name) %>%
+  ggplot(aes(y = Task.Dataset2, 
+             x = Compound.Name)) +
+  geom_tile(aes(fill = Spearman.bin)) +
+  geom_text(aes(label = Significance), size = 3) +
+  scale_fill_manual("Spearman rho", 
+                      values = c("grey", brewer.pal(8, "Reds")[4:8], "white"),
+                    na.value="white") +
+  #scale_size_manual(name = "FDR < 0.1", values = c("TRUE" = 1, "FALSE" = 0)) +
+  #scale_size(range = c(1, 20))+ 
+  #guides(size = guide_legend(title=NA)) +
+  xlab(NULL) +
+  ylab(NULL) +
+  ggtitle("Predictability of metabolites across datasets") +
+  labs(subtitle = "Metabolites well predicted at least 4 times") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.3, hjust = 1, size = 9),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+print(p)
+rm(HMDBs.to.include, p)
+```
+
+Metabolites never well predicted (and in >3 datasets):
+
+```{r PRED_ACROSS_DATASETS2, fig.width=8, fig.height=4.5}
+HMDBs.to.include <- pred.per.metabolite %>%
+  filter(Count.Well.Predicted == 0) %>%
+  filter(N.Datasets > 3) %>%
+  pull(Task.HMDB)
+
+p <- tmp %>%
+  filter(Task.HMDB %in% HMDBs.to.include) %>%
+  tidyr::complete(Task.Dataset2, Compound.Name) %>%
+  ggplot(aes(y = Task.Dataset2, 
+             x = Compound.Name)) +
+  geom_tile(aes(fill = Spearman.bin)) +
+  geom_text(aes(label = Significance), size = 3) +
+  scale_fill_manual("Spearman rho", 
+                      values = c("grey", brewer.pal(8, "Reds")[4:8], "white"),
+                    na.value="white") +
+  xlab(NULL) +
+  ylab(NULL) +
+  ggtitle("Predictability of metabolites across datasets") +
+  labs(subtitle = "Metabolites never well predicted") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.3, hjust = 1, size = 9),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+print(p)
+rm(HMDBs.to.include, p)
+```
+
+Metabolites well predicted only once (and appears in at least 3 datasets):
+
+```{r PRED_ACROSS_DATASETS3, fig.width=11, fig.height=4.3}
+HMDBs.to.include <- pred.per.metabolite %>%
+  filter(Count.Well.Predicted == 1) %>%
+  filter(N.Datasets > 3) %>%
+  pull(Task.HMDB)
+
+p <- tmp %>%
+  filter(Task.HMDB %in% HMDBs.to.include) %>%
+  tidyr::complete(Task.Dataset2, Compound.Name) %>%
+  ggplot(aes(y = Task.Dataset2, 
+             x = Compound.Name)) +
+  geom_tile(aes(fill = Spearman.bin)) +
+  geom_text(aes(label = Significance), size = 3) +
+  scale_fill_manual("Spearman rho", 
+                      values = c("grey", brewer.pal(8, "Reds")[4:8], "white"),
+                    na.value="white") +
+  xlab(NULL) +
+  ylab(NULL) +
+  ggtitle("Predictability of metabolites across datasets") +
+  labs(subtitle = "Metabolites well predicted 1 time only") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.3, hjust = 1, size = 9),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+print(p)
+rm(HMDBs.to.include, p)
+```
+
+A combined figure with examples from each of the 3 cases above:  
+
+```{r fig.height=3.7, fig.width=10.5}
+examples.never.wp <- c("3-Hydroxycapric acid","Anserine",
+                       "Caffeine","Indoleacetic acid",
+                       "N-a-Acetyl-L-arginine",
+                       "Propionic acid","Pyroglutamic acid",
+                       "Hexadecanedioic acid",
+                       "Guanine","L-Fucose")
+examples.wp.once <- c("1-Methylnicotinamide",
+                      "4-Hydroxybenzaldehyde",
+                      "L-Proline","N2-Acetylornithine",
+                      "Sphinganine",
+                      "Trimethylamine N-oxide",
+                      "3-Hydroxybutyric acid","Phenylacetic acid",
+                      "Ursodeoxycholic acid",
+                      "Myristic acid")
+examples.wp.4p <- c("Azelaic acid","beta-Alanine",
+                    "Dodecanedioic acid","D-Glucose",
+                    "Putrescine",
+                    "Sebacic acid","Taurine",
+                    "Uric acid","Urobilin","L-Tyrosine")
+
+Comps.to.include <- data.frame(Compound.Name = c(examples.never.wp, examples.wp.once, examples.wp.4p),
+                               Category = factor(c(rep("Never well-predicted",10),
+                                                   rep("Well-predicted once",10),
+                                                   rep("Well-predicted in >3 datasets",10)),
+                                                 levels = c("Never well-predicted", "Well-predicted once", "Well-predicted in >3 datasets")),
+                               stringsAsFactors = FALSE)
+
+p <- tmp %>%
+  filter(Compound.Name %in% Comps.to.include$Compound.Name) %>%
+  tidyr::complete(Task.Dataset2, Compound.Name) %>%
+  left_join(Comps.to.include, by = "Compound.Name") %>%
+  ggplot(aes(y = Task.Dataset2, 
+             x = Compound.Name)) +
+  geom_tile(aes(fill = Spearman.bin)) +
+  geom_text(aes(label = Significance), size = 3) +
+  scale_fill_manual("Spearman's \u03c1", 
+                    breaks = levels(tmp$Spearman.bin),
+                    values = c("grey", brewer.pal(8, "Reds")[4:8]),
+                    na.value="white") +
+  xlab(NULL) +
+  ylab("Dataset") +
+  facet_wrap(~ Category, scales = "free_x", nrow = 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.3, hjust = 1, size = 10),
+        axis.text.y = element_text(size = 10),
+        axis.title.y = element_text(size = 13),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        legend.key = element_rect(color="black"),
+        panel.border = element_rect(colour = "black", fill=NA),
+        panel.grid.major = element_blank(), 
+        panel.margin.x = unit(0, "lines"),
+        panel.grid.minor = element_blank())
+
+print(p)
+rm(Comps.to.include, p, examples.never.wp, 
+   examples.wp.once, examples.wp.4p, tmp)
+```
+
+## 6. Random effcet models (REMs)
+
+For explanations about meta-analysis random-effects models see: *Borenstein, Michael, et al. Introduction to meta-analysis. John Wiley & Sons, 2011.* 
+
+### Calculations
+
+We use a random-effects model per each metabolite analyzed. The predictability estimation from each dataset, measured by Spearman's correlation, is used as the 'effect size'.  
+Only healthy datasets considered here.  
+We compare results from a few different random-effects settings (variance estimators, transformation from correlation r to Fisher's z, etc.).  
+
+```{r REM_CALCULATIONS, eval=FALSE}
+# ------------------ Settings and preparations --------------------->
+# We will use the REM.result table to store all main results. 
+# We will also store the full metacor result objects in case we need them, 
+#  in "full.REM.results".
+min.num.of.studies.allowed <- 3
+studies.to.include <- unique(metab.pred.results.sum$Task.Dataset)
+
+# First we get all metabolites (+ pipe settings) we want to analyze
+REM.settings <- metab.pred.results.sum %>%
+  select(Task.HMDB, Compound.Name) %>%
+  distinct()
+
+# We add a few other setting options
+REM.settings <- merge(REM.settings, 
+                     data.frame(REM.Tau.Method = c("DL", "SJ"))) 
+REM.settings <- merge(REM.settings, 
+                     data.frame(REM.Z.Trans = c("ZCOR"))) 
+REM.settings <- merge(REM.settings, 
+                     data.frame(REM.HAKN.Adjust = c(FALSE, TRUE)))  # TRUE 
+
+full.REM.results <- list()
+
+# ----------------- Iterate over each metabolite ------------------->
+# For each compound calculate the random effects model.
+REM.results <- foreach (i = 1:nrow(REM.settings), 
+                        .combine=rbind,
+                        .packages = c('dplyr', 'meta', 'DescTools')) %do% { 
+                          
+  if (i%%10==0) { cat(".") }
+  if (i%%200==0) { print(paste0("Completed ", i, "/", 
+                                 nrow(REM.settings), " (", 
+                                 format(Sys.time(), format="%H:%M:%S"), 
+                                 ")")) }
+
+  tmp.compound.name <- REM.settings$Compound.Name[i]
+  tmp.method <- REM.settings$REM.Tau.Method[i]
+  tmp.z <- REM.settings$REM.Z.Trans[i] 
+  tmp.hakn <- REM.settings$REM.HAKN.Adjust[i]
+  
+  # ----------------------- Get relevant data ---------------------->
+  tmp.data <- metab.pred.results.sum %>%
+    filter(Task.Dataset %in% studies.to.include) %>%
+    filter(Compound.Name == tmp.compound.name) %>%
+    left_join(datasets.summary %>% select(Dataset, N.subjects) %>% rename(Task.Dataset = Dataset), by = "Task.Dataset") %>%
+    mutate(N.Samples.Final = ifelse(N.subjects==-1, N.Train.Samples, N.subjects))
+  
+  # ------- Skip if not enough studies using these settings -------->
+  if (nrow(tmp.data) < min.num.of.studies.allowed) {return(NULL)}
+  
+  # ----------------- Calculate meta-analysis REM ------------------>
+  m.cor <- metacor(cor = Avg.Spearman, 
+                 n = N.Samples.Final, 
+                 data = tmp.data,
+                 studlab = tmp.data$Task.Dataset,
+                 sm = tmp.z, # Z-transformation options (COR/ZCOR)
+                 method.tau = tmp.method, # method to estimate the between-study variance 
+                 hakn = tmp.hakn, 
+                 comb.fixed = FALSE,
+                 comb.random = TRUE, 
+                 prediction = TRUE,
+                 title = paste(tmp.compound.name,"predictability"))
+  
+  # ------------------------- Save results ------------------------->
+  full.REM.results[[paste(tmp.compound.name,  
+                          tmp.method, 
+                          tmp.z, 
+                          tmp.hakn, 
+                          sep = "~")]] <- m.cor
+  
+  # Fill columns in summarized result table
+  return(data.frame(HMDB = REM.settings$Task.HMDB[i],
+                    Compound.Name = tmp.compound.name,
+                    Pipe.ID = chosen.pipe,
+                    Tau.Method = tmp.method,
+                    Z.Transformation = tmp.z,
+                    HAKN.Adjustment = tmp.hakn,
+                    N.Datasets = nrow(tmp.data),
+                    Predictability.rho = FisherZInv(m.cor$TE.random),
+                    Lower.Predictability.rho = FisherZInv(m.cor$lower.random),
+                    Upper.Predictability.rho = FisherZInv(m.cor$upper.random),
+                    Pval.rho = m.cor$pval.random,
+                    Lower.pred.interval = m.cor$lower.predict,
+                    Upper.pred.interval = m.cor$upper.predict,
+                    Q = m.cor$Q,
+                    Pval.Q = m.cor$pval.Q,
+                    I2 = m.cor$I2,
+                    Lower.I2 = m.cor$lower.I2,
+                    Upper.I2 = m.cor$upper.I2,
+                    stringsAsFactors = F))
+}
+print("DONE!")
+
+# ---------------------- Apply FDR correction ---------------------->
+REM.results <- REM.results %>%
+  group_by(Pipe.ID,
+           Tau.Method,
+           Z.Transformation,
+           HAKN.Adjustment) %>%
+  mutate(FDR.rho = p.adjust(Pval.rho, method = "fdr"))
+
+# ----------- Save to files (in order not to recompute) ------------>
+write.table(REM.results, quote = FALSE, sep = "\t", 
+            file = 'data/REM_results.tsv',
+            row.names = FALSE)
+save(full.REM.results, 
+     file = 'data/full_REM_results.RData')
+
+# ---------------------------- Clean up ---------------------------->
+rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, min.num.of.studies.allowed)
+```
+
+### Organize results
+
+```{r}
+# --------- Load REM results if it didn't just run ---------->
+if(!exists("REM.results")) {
+  REM.results <- read.delim('../data/REM_results.tsv', 
+                            stringsAsFactors = F)
+  load('../data/full_REM_results.RData')
+}
+
+print(paste(n_distinct(REM.results$HMDB),"metabolites were analyzed with REMs"))
+```
+
+### Compare REM methods
+
+PI = Prediction Interval.  
+
+```{r}
+REM.summary.stats <- REM.results %>%
+  # String with all REM settings (for presentation)
+  mutate(Method = paste(Z.Transformation,
+                        Tau.Method,
+                        ifelse(HAKN.Adjustment,"HAKN","Uncorrected"), 
+                        sep = " ~ ")) %>%
+  ungroup() %>%
+  select(-c(Z.Transformation, Tau.Method, HAKN.Adjustment)) %>%
+  group_by(Method) %>%
+  # Summary stats about meta-analysis results in different settings
+  summarise(Total.Pairs.With.REMs = 
+              sum(!is.na(Pval.rho), na.rm = T),
+            Well.Predicted.FDR.0.05 = 
+              sum(FDR.rho < 0.05 & Predictability.rho > 0.3, na.rm = T),
+            Well.Predicted.FDR.0.1 = 
+              sum(FDR.rho < 0.1 & Predictability.rho > 0.3, na.rm = T),
+            Significant.Heterogeneity.I2.50.FDR.0.1 = 
+              sum(FDR.rho < 0.1 & I2 >= 0.5, na.rm = T),
+            Prediction.Interval.No.Overlap.FDR.0.1 = 
+              sum(FDR.rho < 0.1 & Predictability.rho > 0.3 & 
+              (Upper.pred.interval < 0 | Lower.pred.interval > 0), na.rm = T),
+            .groups = "drop") 
+```
+
+```{r}
+REM.summary.stats %>%
+  rename(`Total num of pairs with REMs` = Total.Pairs.With.REMs) %>%
+  rename(`Significant Effect FDR<0.05` = Well.Predicted.FDR.0.05) %>%
+  rename(`Significant Effect FDR<0.1` = Well.Predicted.FDR.0.1) %>%
+  rename(`Significant Heterogeneity I2>50% and FDR<0.1` = Significant.Heterogeneity.I2.50.FDR.0.1) %>%
+  rename(`PI - No Overlap and FDR<0.1` = Prediction.Interval.No.Overlap.FDR.0.1) %>%
+  kable(format = "html", escape = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"), font_size = 13) %>%
+  column_spec(1:2, background = "lightgrey")
+```
+
+### Choose REM setting
+
+We choose the DL method, and consider all the pairs with overall-effect > 0.3 and FDR < 0.1 as universal.
+
+```{r}
+selected.z <- "ZCOR"
+selected.hakn <- FALSE
+selected.tau <- "DL"
+rho.threshold.REM <- 0.3
+
+REM.universal <- REM.results %>% 
+  filter(Pipe.ID == chosen.pipe) %>%
+  filter(HAKN.Adjustment == selected.hakn) %>% 
+  filter(Tau.Method == selected.tau) %>%
+  filter(Z.Transformation == selected.z) %>%
+  filter(FDR.rho < fdr.threshold) %>%
+  filter(Predictability.rho > rho.threshold.REM) %>%
+  mutate(Non.Overlapping.PI = 
+           (Upper.pred.interval <= 0 | 
+              Lower.pred.interval >= 0))
+
+print(paste0("Using a cutoff of FDR < ",
+             fdr.threshold,
+             " and spearman rho > ", 
+             rho.threshold.REM,", ", 
+             nrow(REM.universal), 
+             " metabolites are universally predictable by the microbiome."))
+print(paste("Of these,", 
+            nrow(REM.universal %>% filter(Non.Overlapping.PI)), 
+            "also have a 95% prediction interval that is completely positive. Note: prediction intervals are only relevant for comparisons of >3 studies."))
+```
+
+## 7. Explore universal microbiome-associated metabolites
+
+### REM forest plots {.tabset}
+
+These are the traditional REM plots.  
+
+#### Summarized view
+
+```{r TOP_UNIVERSAL_SUMMARIZED, fig.height=5.3, fig.width=4.6}
+num.to.plot <- 20
+
+tmp <- REM.universal %>%
+  select(HMDB,Compound.Name,N.Datasets,Predictability.rho,Lower.Predictability.rho,Upper.Predictability.rho) %>%
+  mutate(Rank = rank(-Predictability.rho)) %>%
+  arrange(Rank) %>%
+  filter(Rank <= num.to.plot) %>%
+  mutate(rev.Rank = num.to.plot + 1 - Rank) %>%
+  left_join(metabolites.conf.flags, by = "HMDB") %>%
+  mutate(label.datasets = paste0("[",N.Datasets,ifelse(Low.Confidence.Count>0,"*",""),"]"))
+
+tmp$Compound.Name <- factor(tmp$Compound.Name, levels = rev(tmp$Compound.Name))
+
+tmp.polygons <- data.frame(stringsAsFactors = F)
+
+for (i in 1:nrow(tmp)) {
+  y.pos <- tmp$rev.Rank[i]
+  l.p.r <- tmp$Lower.Predictability.rho[i]
+  p.r <- tmp$Predictability.rho[i]
+  u.p.r <- tmp$Upper.Predictability.rho[i]
+  tmp.polygons <- bind_rows(tmp.polygons,
+                            data.frame(HMDB = tmp$HMDB[i],
+                                       Compound.Name = tmp$Compound.Name[i],
+                                       x = c(l.p.r, p.r, u.p.r, p.r),
+                                       y = c(y.pos, y.pos+0.25, y.pos, y.pos-0.25),
+                                       stringsAsFactors = F))
+}
+
+ggplot() +
+  geom_text(tmp, mapping = aes(x=Upper.Predictability.rho+0.03, y=Compound.Name, label=label.datasets), size=3.4, hjust=0, vjust=0.3) +  
+  geom_vline(xintercept = 0.3, linetype="dashed", color = "red3", size=1) +
+  geom_polygon(tmp.polygons, mapping = aes(x=x, y=y, group=Compound.Name), 
+               color = "black", fill = "#C0CD99") +
+  scale_x_continuous(limits = c(0,0.9)) +
+  theme_classic() +
+  ylab(NULL) +
+  xlab("Predictability") +
+  theme(axis.text.y = element_text(size = 10))
+
+rm(tmp, i, tmp.polygons, p.r, l.p.r, u.p.r, y.pos, num.to.plot)
+```
+
+#### Classic forest plots
+
+Here we print forest plots for the top 20 universal metabolites (automatic ones from metafor package).  
+
+```{r TOP_UNIVERSAL, fig.width=9, fig.height=4.5}
+# Save default setting and later restore
+par.restore <- par(mar=c(4,4,1,2)) 
+
+# ------------ Choose subset of REMs to plot ------------->
+# We'll only plot the top X effects
+# Note that if their are ties, it will include more than the specified n. 
+REM.to.plot <- REM.universal %>% 
+  top_n(n = 20, Predictability.rho) %>% 
+  arrange(-Predictability.rho)
+
+# --------- Iterate over universal correlations ---------->
+for (i in 1:nrow(REM.to.plot)) {
+  tmp.compound.name <- REM.to.plot$Compound.Name[i]
+  tmp.rem.id <- paste(tmp.compound.name, selected.tau, selected.z, selected.hakn, sep = "~")
+  tmp.m.cor <- full.REM.results[[tmp.rem.id]]
+  
+  # ------------------ Plot forest plot ------------------>
+  forest(tmp.m.cor, 
+         layout = "RevMan5", 
+         col.square = "darkgoldenrod1", 
+         col.square.lines = "black", 
+         test.overall = TRUE)
+  # Add title
+  grid.text(paste(tmp.compound.name,"predictability"), 
+            x=0.5, y=0.81+0.02*(REM.to.plot$N.Datasets[i]-5), 
+            gp=gpar(cex=1.3))
+}
+
+# ----------------------- Clean up ----------------------->
+par(par.restore)
+rm(i, tmp.compound.name, tmp.m.cor, tmp.rem.id, REM.to.plot)
+```
+
+### Classes of well-predicted metabolites
+
+We use HMDB metabolite classes to explore whether some classes are enriched in universal microbial metabolites.  We start by preparing a table useful for universal vs. non-universal comparisons (will also be used in next sections).  
+
+```{r MAIN_VALIDATION_TABLE}
+main.val.table <- REM.results %>% 
+  ungroup() %>%
+  filter(Pipe.ID == chosen.pipe) %>%
+  filter(HAKN.Adjustment == selected.hakn) %>% 
+  filter(Tau.Method == selected.tau) %>%
+  filter(Z.Transformation == selected.z) %>%
+  mutate(Category = ifelse(HMDB %in% unique(REM.universal$HMDB),
+                           "Universally well-predicted",
+                           "Non-universally well-predicted")) %>%
+  select(HMDB, N.Datasets, Category) %>%
+  left_join(metabolite.stats, by = "HMDB") %>%
+  left_join(metab.pred.results.sum %>%
+              group_by(Task.HMDB) %>%
+              summarise(N.well.predicted = sum(Avg.Spearman > rho.threshold & 
+                                                 Avg.Spearman.FDR < fdr.threshold), 
+                        .groups = "drop") %>%
+              rename(HMDB = Task.HMDB), by = "HMDB")
+
+main.val.table2 <- metab.pred.results.sum %>%
+  group_by(Task.HMDB) %>%
+  summarise(N.datasets = n(),
+            N.well.predicted = sum(Avg.Spearman > rho.threshold & Avg.Spearman.FDR < fdr.threshold),
+            .groups = "drop") %>%
+  mutate(Category = ifelse(N.well.predicted / N.datasets < 0.5,
+                           "Well-predicted < 50%",
+                           "Well-predicted >= 50%")) %>%
+  rename(HMDB = Task.HMDB, N.Datasets = N.datasets) %>%
+  left_join(metabolite.stats, by = "HMDB") 
+```
+
+We remove categories (e.g. classes) with less than 5 metabolites total (for plotting simplicity).  
+
+```{r fig.width=9, fig.height=3.3}
+tmp <- main.val.table %>%
+  group_by(Category) %>%
+  mutate(Total.category = n()) %>%
+  ungroup() %>%
+  group_by(Super.Class) %>%
+  filter(n() > 5) %>%
+  group_by(Category, Total.category, Super.Class) %>%
+  summarise(N.metabolites = n(), .groups = "drop") %>%
+  mutate(N.not.in.class = Total.category - N.metabolites) %>%
+  rowwise() %>%
+  mutate(prop = 100 * N.metabolites / Total.category,
+         low = 100 * prop.test(N.metabolites, Total.category)$conf.int[1],
+         upper = 100 * prop.test(N.metabolites, Total.category)$conf.int[2]) %>%
+  group_by(Super.Class) %>%
+  mutate(Super.Class2 = paste0(Super.Class, "\n(N = ",sum(N.metabolites), ")"))
+
+# Add newlines for plotting
+tmp$Super.Class2 <- gsub("Lipids and lipid-like molecules", "Lipids and\nlipid-like\nmolecules", tmp$Super.Class2)
+tmp$Super.Class2 <- gsub("Nucleosides, nucleotides, and analogues", "Nucleosides,\nnucleotides,\nand analogues", tmp$Super.Class2)
+tmp$Super.Class2 <- gsub("Organic acids and derivatives", "Organic acids\nand derivatives", tmp$Super.Class2)
+tmp$Super.Class2 <- gsub("Organic nitrogen compounds", "Organic nitrogen\ncompounds", tmp$Super.Class2)
+tmp$Super.Class2 <- gsub("Organic oxygen compounds", "Organic oxygen\ncompounds", tmp$Super.Class2)
+tmp$Super.Class2 <- gsub("Organoheterocyclic compounds", "Organoheterocyclic\ncompounds", tmp$Super.Class2)
+
+# Fisher's tests
+cls <- unique(tmp$Super.Class)
+fisher.ps <- c()
+for (cl in cls) {
+  tmp.f <- fisher.test(as.matrix(tmp %>% 
+                          filter(Super.Class == cl) %>% 
+                          ungroup() %>% 
+                          select(N.metabolites, N.not.in.class)))
+  print(paste("Fisher P value for",cl,":", tmp.f$p.value))
+  fisher.ps <- c(fisher.ps, tmp.f$p.value)
+}
+fisher.fdrs <- p.adjust(fisher.ps, method = "fdr")
+print("FDRs:")
+print(paste(fisher.fdrs, collapse = ', '))
+
+# Plot
+# TODO: significance marks not automatic
+ggplot(tmp, aes(x = Super.Class2, y = prop, fill = Category)) +
+  geom_bar(stat = "identity", color = "black", position = "dodge") +
+  geom_errorbar(aes(ymin=low, ymax=upper), width=.2, position=position_dodge(.9)) +
+  annotate("rect", xmin = 1.75, xmax = 2.25, ymin = 51, ymax =51, alpha=1, colour = "black") +
+  annotate(geom="text", x=2, y=52, label="*") +
+  ggtitle("Comparison of metabolite super-classes: universally well-predicted vs. others") +
+  theme_classic() + 
+  scale_fill_manual(values = c("gray87","seagreen4")) +
+  xlab(NULL) +
+  ylab("% of total metabolites in category") +
+  theme(axis.text.x = element_text(size = 8)) +
+  theme(legend.position = c(0.8, 0.75))
+
+rm(tmp, cl, cls, fisher.ps, fisher.fdrs, tmp.f)
+```
+
+## 8. Validations {.tabset}
+
+### Zierer et al. (TwinsUK)
+
+We load a table from the paper supplementary that details for each metabolite how much of it's variation is explained by the microbiome.  
+See: *Zierer, Jonas, et al. "The fecal metabolome as a functional readout of the gut microbiome." Nature genetics 50.6 (2018): 790-795.*
+
+```{r TWINSUK_VALIDATION_VAR_EXPLAINED, fig.height=2.5, fig.width=5.1}
+load("../data/Zierer_et_al_2018/Zierer_TwinsUK_Associations.RData")
+twinsUK.MM.var.explained <- read.xls("../data/Zierer_et_al_2018/Variance components and phenotype associations of fecal metabolites.xlsx", 
+                                       sheet=1, skip=1, header=TRUE)
+twinsUK.MM.var.explained <- twinsUK.MM.var.explained %>%
+  select(ID, Metabolite, M, p) %>%
+  mutate(var.explained = as.numeric(gsub(" \\(.*\\)", "", M))) %>%
+  # We use the mapping to HMDB's already conducted for previous file
+  left_join(twinsUK.associations %>% 
+              select(Metabolite, HMDB) %>% 
+              distinct() %>% 
+              rename(ID = Metabolite), by = "ID")
+```
+
+
+```{r fig.width=3, fig.height=4}
+tmp <- REM.results %>%
+  ungroup() %>%
+  filter(Pipe.ID == chosen.pipe) %>%
+  filter(HAKN.Adjustment == selected.hakn) %>% 
+  filter(Tau.Method == selected.tau) %>%
+  filter(Z.Transformation == selected.z) %>%
+  select(HMDB, Predictability.rho) %>%
+  inner_join(twinsUK.MM.var.explained %>% select(HMDB, var.explained), by = "HMDB") %>%
+  mutate(Universal = ifelse(HMDB %in% REM.universal$HMDB, "Universally\nwell-predicted", "Non-universally\nwell-predicted"))
+
+# Continuous to binary
+(tmp2 <- wilcox.test(tmp$var.explained~tmp$Universal))
+
+ggplot(tmp, aes(x=Universal, fill = Universal, 
+                y=var.explained)) +
+  geom_boxplot(outlier.shape = NA)+
+  geom_jitter(shape=16, alpha = 0.5, 
+              position=position_jitter(0.2)) +
+  scale_fill_manual(values = c("gray77","seagreen4")) +
+  ylab("Metabolite variance explained by the microbiome\n(Zierer et al. 2019)") +
+  xlab(NULL) + #xlab("Universally well-predicted\nby the microbiome") +
+  annotate("rect", ymin = 1.04, ymax = 1.04, xmin = 1, xmax = 2, alpha=1, colour = "black") +
+  annotate(geom="text", y=1.06, x=1.5, label=get.signif.marks(tmp2$p.value)) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+rm(tmp, tmp2)
+```
+
+
+
