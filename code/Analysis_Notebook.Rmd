@@ -1210,7 +1210,7 @@ rm(Comps.to.include, p, examples.never.wp,
    examples.wp.once, examples.wp.4p, tmp)
 ```
 
-## 6. Random effcet models (REMs)
+## 6. Random-effcets models (REMs)
 
 For explanations about meta-analysis random-effects models see: *Borenstein, Michael, et al. Introduction to meta-analysis. John Wiley & Sons, 2011.* 
 
@@ -1323,10 +1323,10 @@ REM.results <- REM.results %>%
 
 # ----------- Save to files (in order not to recompute) ------------>
 write.table(REM.results, quote = FALSE, sep = "\t", 
-            file = 'data/REM_results.tsv',
+            file = '../data/REM_results.tsv',
             row.names = FALSE)
 save(full.REM.results, 
-     file = 'data/full_REM_results.RData')
+     file = '../data/full_REM_results.RData')
 
 # ---------------------------- Clean up ---------------------------->
 rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, min.num.of.studies.allowed)
@@ -1604,25 +1604,80 @@ rm(tmp, cl, cls, fisher.ps, fisher.fdrs, tmp.f)
 
 ## 8. Validations {.tabset}
 
+### Mallick et al. (MelonnPan)
+
+Mallick et al. (2019) describe a machine learning tool for predicting metabolite levels based on microbiome profiles. As a sanity check of our pipeline, we compare the list of metabolites well-predicted by their method to well-predicted metabolites in our pipeline, using the same dataset (refered to as FRANZOSA_IBD here) as the one they use. 
+
+Notes:
+* We only use the metabolites we were able to obtain HMDB identifiers for  
+* They validated their model's performance on the dutch part of the cohort, while we used LOOCV on the PRISM + dutch cohorts together.
+* We used healthy subjects only while they mixed study groups
+* The metabolites in white, below, were either not included due to inability to map them to HMDB identifiers, or because those metabolites are missing from our pipeline (e.g. did not appear in at least 3 datasets).
+
+See: *Mallick, Himel, et al. "Predictive metabolomic profiling of microbial communities using amplicon or metagenomic sequences." Nature communications 10.1 (2019): 1-11.*  
+
+```{r fig.height=4, fig.width=3}
+franzosa.well.predicted.by.us <- metab.pred.results.sum %>% 
+  filter(Task.Dataset == "FRANZOSA_IBD_HEALTHY") %>% 
+  rename(HMDB = Task.HMDB)
+
+melonnpan.well.predicted <- read.xls("../data/MelonnPan_supp_table_3_withHMDB.xlsx", 
+                                       sheet=1, skip=1, header=TRUE)
+
+melonnpan.well.predicted.2 <- melonnpan.well.predicted %>%
+  left_join(franzosa.well.predicted.by.us, by = "HMDB") %>%
+  mutate(HMDB = ifelse(HMDB=="", NA, HMDB)) %>%
+  mutate(Category = ifelse(is.na(HMDB), "No mapping to HMDB",
+                           ifelse(is.na(Avg.Spearman), "Not included in current analysis",
+                                  ifelse(Avg.Spearman > 0.3 & Avg.Spearman.FDR < 0.1,
+                                         "Well-predicted by current pipeline",
+                                         "Not well-predicted by current pipeline"))))
+
+ggplot(data.frame(table(melonnpan.well.predicted.2$Category)), 
+  aes(x="", y=Freq, fill=Var1)) +
+  geom_bar(width = 1, stat = "identity", color = "black") +
+  coord_polar("y", start=0) +
+  scale_fill_manual(values=c("No mapping to HMDB" = "white",
+                             "Not included in current analysis" = "gray91",
+                             "Not well-predicted by current pipeline" = "salmon3",
+                             "Well-predicted by current pipeline" = 'seagreen4')) +
+  theme_minimal()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        panel.border = element_blank(),
+        panel.grid=element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(),
+        legend.position = "bottom",
+        legend.direction = "vertical",
+        legend.title=element_blank()) +
+  geom_text(aes(label = percent(Freq/nrow(melonnpan.well.predicted)), x = 1.3),
+            position = position_stack(vjust = 0.5), size = 4)
+
+rm(franzosa.well.predicted.by.us, melonnpan.well.predicted, melonnpan.well.predicted.2)
+```
+
 ### Zierer et al. (TwinsUK)
 
-We load a table from the paper supplementary that details for each metabolite how much of it's variation is explained by the microbiome.  
-See: *Zierer, Jonas, et al. "The fecal metabolome as a functional readout of the gut microbiome." Nature genetics 50.6 (2018): 790-795.*
+Here we confirm that universally well-predicted metabolites have a larger proportion of their variance explained by the microbiome, as estimated by an independent study of the largest microbiome-metabolome dataset collected to date (twinsUK). See: *Zierer, Jonas, et al. "The fecal metabolome as a functional readout of the gut microbiome." Nature genetics 50.6 (2018): 790-795.*  
 
-```{r TWINSUK_VALIDATION_VAR_EXPLAINED, fig.height=2.5, fig.width=5.1}
-load("../data/Zierer_et_al_2018/Zierer_TwinsUK_Associations.RData")
+For this purpose we use a supplementary table from the paper, and mappings to HMDB ID's.
+
+```{r TWINSUK_VALIDATION_VAR_EXPLAINED}
+twinsUK.metab.mappings <- read_delim("../data/Zierer_et_al_2018/Metabolite_HMDB_Mappings.tsv", 
+                                       "\t", escape_double = FALSE, trim_ws = TRUE)
 twinsUK.MM.var.explained <- read.xls("../data/Zierer_et_al_2018/Variance components and phenotype associations of fecal metabolites.xlsx", 
                                        sheet=1, skip=1, header=TRUE)
+
 twinsUK.MM.var.explained <- twinsUK.MM.var.explained %>%
   select(ID, Metabolite, M, p) %>%
   mutate(var.explained = as.numeric(gsub(" \\(.*\\)", "", M))) %>%
-  # We use the mapping to HMDB's already conducted for previous file
-  left_join(twinsUK.associations %>% 
+  # We use a pre-calculated mapping to HMDB ID's using MetaboAnalyst
+  left_join(twinsUK.metab.mappings %>% 
               select(Metabolite, HMDB) %>% 
               distinct() %>% 
               rename(ID = Metabolite), by = "ID")
 ```
-
 
 ```{r fig.width=3, fig.height=4}
 tmp <- REM.results %>%
@@ -1654,5 +1709,264 @@ ggplot(tmp, aes(x=Universal, fill = Universal,
 rm(tmp, tmp2)
 ```
 
+## 9. Subgroups REMs
 
+### Calculations - Healthy vs. Disease
+
+We only consider metabolites that appeared at least 3 times in the healthy datasets and 3 times in disease.   
+
+```{r REM_SUBGROUP_CALCULATIONS, eval=FALSE}
+# ------------------ Settings and preparations --------------------->
+# Get metabolites to analyze - at least 3 times in health...
+REM.settings <- metab.pred.results.sum %>%
+  group_by(Task.HMDB, Compound.Name) %>%
+  filter(n() >= 3) %>%
+  select(Task.HMDB, Compound.Name) %>%
+  distinct()
+n1 <- nrow(REM.settings)
+
+# ... and 3 times in disease
+keep.these <- metab.pred.results.dis %>%
+  group_by(Task.HMDB, Compound.Name) %>%
+  filter(n() >= 3) %>%
+  select(Task.HMDB, Compound.Name) %>%
+  distinct()
+
+REM.settings <- REM.settings %>%
+  inner_join(keep.these, by = c("Task.HMDB", "Compound.Name"))
+
+print(paste("Out of", n1, "metabolites analyzed in the healthy datasets,",
+            nrow(REM.settings)," also appeared 3 or more times in disease datasets.",
+            "These will participate in the subgroup analysis."))
+
+# We add a few other setting options
+REM.settings <- merge(REM.settings, 
+                     data.frame(REM.Tau.Method = c("DL"))) #"PM", "SJ"
+REM.settings <- merge(REM.settings, 
+                     data.frame(REM.Z.Trans = c("ZCOR"))) # "COR"
+REM.settings <- merge(REM.settings, 
+                     data.frame(REM.HAKN.Adjust = c(FALSE)))  # TRUE 
+
+# Place holder for combined REM (REM that simply includes both healthy and disease datasets) and subgroup REM (which further analyzes differences between groups)
+healthy.disease.REM.results <- list()
+subgroup.REM.results <- list()
+
+# ----------------- Iterate over each metabolite ------------------->
+# For each compound calculate the random effects model.
+REM.subgroup.results <- foreach (i = 1:nrow(REM.settings), 
+                        .combine=rbind,
+                        .packages = c('dplyr', 'meta', 'DescTools')) %do% { # i = 161
+                          
+  if (i%%10==0) { cat(".") }
+  if (i%%100==0) { print(paste0("Completed ", i, "/", 
+                                 nrow(REM.settings), " (", 
+                                 format(Sys.time(), format="%H:%M:%S"), 
+                                 ")")) }
+
+  tmp.compound.name <- REM.settings$Compound.Name[i]
+  tmp.method <- REM.settings$REM.Tau.Method[i]
+  tmp.z <- REM.settings$REM.Z.Trans[i] 
+  tmp.hakn <- REM.settings$REM.HAKN.Adjust[i]
+  
+  # ----------------------- Get relevant data ---------------------->
+  tmp.data <- bind_rows(metab.pred.results.sum,
+                        metab.pred.results.dis) %>%
+    filter(Compound.Name == tmp.compound.name) %>%
+    left_join(datasets.summary %>% 
+                select(Dataset, N.subjects) %>% 
+                rename(Task.Dataset = Dataset), 
+              by = "Task.Dataset") %>%
+    mutate(N.Samples.Final = ifelse(N.subjects==-1, N.Train.Samples, N.subjects))
+  
+  # ----------------- Calculate meta-analysis REM ------------------>
+  m.cor <- metacor(cor = Avg.Spearman, 
+                 n = N.Samples.Final, 
+                 data = tmp.data,
+                 studlab = tmp.data$Task.Dataset,
+                 sm = tmp.z, # Z-transformation options (COR/ZCOR)
+                 method.tau = tmp.method, # method to estimate the between-study variance 
+                 hakn = tmp.hakn, 
+                 comb.fixed = FALSE,
+                 comb.random = TRUE, 
+                 prediction = TRUE,
+                 title = paste(tmp.compound.name,"predictability"))
+  
+  # ------------------------- Save results ------------------------->
+  analysis.id <- paste(tmp.compound.name,  
+                          tmp.method, 
+                          tmp.z, 
+                          tmp.hakn, 
+                          sep = "~")
+  healthy.disease.REM.results[[analysis.id]] <- m.cor
+  
+   # ------------------------ Get subgroups ------------------------>
+  # Replaces the name of each study included in this meta-analysis 
+  #  object with a label "HEALTHY" or "DISEASE".
+  subgroups <- sapply(strsplit(m.cor$studlab, split = "_"), last)
+   
+  # ---------------- Run subgroup meta analysis -------------------->
+  meta.subgroups <- subgroup.analysis.mixed.effects2(x = m.cor, 
+                                                     subgroups = subgroups)
+  subgroup.REM.results[[analysis.id]] <- meta.subgroups
+  
+  # Fill columns in summarized result table
+  return(data.frame(HMDB = REM.settings$Task.HMDB[i],
+                    Compound.Name = tmp.compound.name,
+                    Pipe.ID = chosen.pipe,
+                    Tau.Method = tmp.method,
+                    Z.Transformation = tmp.z,
+                    HAKN.Adjustment = tmp.hakn,
+                    N.Datasets = nrow(tmp.data),
+                    N.Healthy.Datasets = sum(subgroups == "HEALTHY"),
+                    N.Disease.Datasets = sum(subgroups != "HEALTHY"),
+                    Overall.Predictability.rho = FisherZInv(m.cor$TE.random),
+                    Overall.Lower.Predictability.rho = FisherZInv(m.cor$lower.random),
+                    Overall.Upper.Predictability.rho = FisherZInv(m.cor$upper.random),
+                    Overall.Pval.rho = m.cor$pval.random,
+                    Overall.Lower.pred.interval = m.cor$lower.predict,
+                    Overall.Upper.pred.interval = m.cor$upper.predict,
+                    Overall.Q = m.cor$Q,
+                    Overall.Pval.Q = m.cor$pval.Q,
+                    Overall.I2 = m.cor$I2,
+                    Overall.Lower.I2 = m.cor$lower.I2,
+                    Overall.Upper.I2 = m.cor$upper.I2,
+                    Healthy.rho = meta.subgroups$within.subgroup.results["HEALTHY","TE"],
+                    Healthy.rho.lower.ci = meta.subgroups$within.subgroup.results["HEALTHY","LLCI"],
+                    Healthy.rho.upper.ci = meta.subgroups$within.subgroup.results["HEALTHY","ULCI"],
+                    Healthy.Pval = meta.subgroups$within.subgroup.results["HEALTHY","p"],
+                    Healthy.I2 = meta.subgroups$within.subgroup.results["HEALTHY","I2"],
+                    Disease.rho = meta.subgroups$within.subgroup.results["DISEASE","TE"],
+                    Disease.rho.lower.ci = meta.subgroups$within.subgroup.results["DISEASE","LLCI"],
+                    Disease.rho.upper.ci = meta.subgroups$within.subgroup.results["DISEASE","ULCI"],
+                    Disease.Pval = meta.subgroups$within.subgroup.results["DISEASE","p"],
+                    Disease.I2 = meta.subgroups$within.subgroup.results["DISEASE","I2"],
+                    Between.Subgroups.Q = meta.subgroups$subgroup.analysis.results$Q,
+                    Between.Subgroups.Pval = meta.subgroups$subgroup.analysis.results$p,
+                    stringsAsFactors = F))
+}
+print("DONE!")
+
+# ---------------------- Apply FDR correction ---------------------->
+REM.subgroup.results$Overall.FDR.rho <- p.adjust(REM.subgroup.results$Overall.Pval.rho, method = "fdr")
+REM.subgroup.results$Healthy.FDR <- p.adjust(REM.subgroup.results$Healthy.Pval, method = "fdr")
+REM.subgroup.results$Disease.FDR <- p.adjust(REM.subgroup.results$Disease.Pval, method = "fdr")
+REM.subgroup.results$Between.Subgroups.FDR <- p.adjust(REM.subgroup.results$Between.Subgroups.Pval, method = "fdr")
+
+# ----------- Save to files (in order not to recompute) ------------>
+write.table(REM.subgroup.results, quote = FALSE, sep = "\t", 
+            file = '../data/subgroup_REM_results.tsv',
+            row.names = FALSE)
+save(list = c("subgroup.REM.results","healthy.disease.REM.results"), 
+     file = '../data/full_subgroup_REM_results.RData')
+
+# ---------------------------- Clean up ---------------------------->
+rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, keep.these, tmp.method,  tmp.hakn, tmp.z)
+```
+
+### Organize results
+
+```{r REM_SUBGROUP_ORGANIZE}
+# --------- Load REM results if it didn't just run ---------->
+if(!exists("REM.subgroup.results")) {
+  REM.subgroup.results <- read.delim('../data/subgroup_REM_results.tsv', stringsAsFactors = F)
+  load('../data/full_subgroup_REM_results.RData')
+}
+
+print(paste(n_distinct(REM.subgroup.results$HMDB),"metabolites were analyzed in the subgroup REM analysis"))
+```
+
+### Custom plots
+
+```{r CUSTOM_SUBGROUP_REM_PLOTS, fig.height=7, fig.width=8}
+tmp <- REM.subgroup.results %>%
+  filter(HMDB %in% REM.universal$HMDB[REM.universal$Predictability.rho>0.445])
+
+tmp1 <- tmp %>%
+  select(HMDB,Compound.Name,N.Healthy.Datasets,Healthy.rho,Healthy.rho.lower.ci,Healthy.rho.upper.ci) %>%
+  rename(N.Datasets = N.Healthy.Datasets) %>%
+  rename(Predictability.rho = Healthy.rho) %>%
+  rename(Lower.Predictability.rho = Healthy.rho.lower.ci) %>%
+  rename(Upper.Predictability.rho = Healthy.rho.upper.ci) %>%
+  mutate(h.d. = "Healthy") %>%
+  mutate(y.pos = 2) 
+
+tmp2 <- tmp %>%
+  select(HMDB,Compound.Name,N.Disease.Datasets,Disease.rho,Disease.rho.lower.ci,Disease.rho.upper.ci) %>%
+  rename(N.Datasets = N.Disease.Datasets) %>%
+  rename(Predictability.rho = Disease.rho) %>%
+  rename(Lower.Predictability.rho = Disease.rho.lower.ci) %>%
+  rename(Upper.Predictability.rho = Disease.rho.upper.ci) %>%
+  mutate(h.d. = "Disease") %>%
+  mutate(y.pos = 3) 
+
+tmp3 <- tmp %>%
+  select(HMDB,Compound.Name,Overall.Predictability.rho,
+         Overall.Lower.Predictability.rho, Overall.Upper.Predictability.rho) %>%
+  rename(Predictability.rho = Overall.Predictability.rho) %>%
+  rename(Lower.Predictability.rho = Overall.Lower.Predictability.rho) %>%
+  rename(Upper.Predictability.rho = Overall.Upper.Predictability.rho) %>%
+  mutate(h.d. = "Overall") %>%
+  mutate(y.pos = 1) %>%
+  arrange(-Predictability.rho)
+
+tmp <- bind_rows(tmp1, tmp2, tmp3) %>%
+  left_join(metabolites.conf.flags, by = "HMDB") %>%
+  mutate(label.datasets = ifelse(h.d. == "Overall",
+                                 "",
+                                 paste0("[",N.Datasets,ifelse(Low.Confidence.Count>0,
+                                                              "*",""),
+                                        "]"))) %>%
+  mutate(Compound.Name = factor(Compound.Name, levels = tmp3$Compound.Name)) %>%
+  mutate(h.d. = factor(h.d., levels = c("Overall", "Healthy", "Disease")))
+
+# Break some of the long metabolite names
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="Dihomo-gamma-linolenic acid"] <- "Dihomo-gamma-\nlinolenic acid"
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="Docosapentaenoic acid (22n-6)"] <- "Docosapentaenoic\nacid (22n-6)"
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="7-Ketodeoxycholic acid"] <- "7-Ketodeoxycholic\nacid"
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="Symmetric dimethylarginine"] <- "Symmetric\ndimethylarginine"
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="N-Acetyl-L-glutamic acid"] <- "N-Acetyl-L-\nglutamic acid"
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="Asymmetric dimethylarginine"] <- "Asymmetric\ndimethylarginine"
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="N1,N12-Diacetylspermine"] <- "N1,N12-\nDiacetylspermine"
+levels(tmp$Compound.Name)[levels(tmp$Compound.Name)=="Linoleoyl ethanolamide"] <- "Linoleoyl\nethanolamide"
+
+tmp.polygons <- data.frame(stringsAsFactors = F)
+
+for (i in 1:nrow(tmp)) {
+  y.pos <- tmp$y.pos[i]
+  l.p.r <- tmp$Lower.Predictability.rho[i]
+  p.r <- tmp$Predictability.rho[i]
+  u.p.r <- tmp$Upper.Predictability.rho[i]
+  tmp.polygons <- bind_rows(tmp.polygons,
+                            data.frame(HMDB = tmp$HMDB[i],
+                                       Compound.Name = tmp$Compound.Name[i],
+                                       h.d = tmp$h.d.[i],
+                                       x = c(l.p.r, p.r, u.p.r, p.r),
+                                       y = c(y.pos, y.pos+0.25, y.pos, y.pos-0.25),
+                                       stringsAsFactors = F))
+}
+
+ggplot() +
+  geom_text(tmp, mapping = aes(x=Upper.Predictability.rho+0.03, 
+                               y=y.pos, label=label.datasets), 
+            size=3.4, hjust=0, vjust=0.3) +
+  geom_vline(xintercept = 0.3, linetype="dashed", color = "red3", size=1) +
+  geom_polygon(tmp.polygons,
+               mapping = aes(x=x, y=y, group=h.d, fill = h.d),
+               colour="black") +
+  scale_x_continuous(limits = c(0,0.91)) +
+  scale_y_continuous(breaks = 1:3, labels = levels(tmp$h.d.)) +
+  scale_fill_manual(values = c("Healthy" = "#C0CD99", "Disease" = "#e26d5c", "Overall" = "black")) +
+  theme_bw() +
+  ylab(NULL) +
+  xlab("Predictability") +
+  facet_wrap(~ Compound.Name, ncol = 2, strip.position="right") +
+  theme(axis.text.y = element_text(size = 9.5),
+        strip.text.y = element_text(angle=0, hjust = 0),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        strip.background = element_blank(), #element_rect(colour = "black", fill = "lightgrey"),
+        legend.position = "none")
+
+rm(tmp, tmp1, tmp2, tmp3, i, tmp.polygons, p.r, l.p.r, u.p.r, y.pos)
+```
 
