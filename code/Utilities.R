@@ -363,6 +363,256 @@ get.final.args.pretty <- function(final.model) {
 }
 
 
+##############################################################
+# 3. Model comparison functions
+##############################################################
+
+# Given a full contributions table, extract only contributions relevant to a specific hmdb id 
+#  and add cross-study statistics such as mean importance score.
+get.hmdb.contribs <- function(contribs, hmdb, healthy.only = T) {
+  tmp <- contribs %>% 
+    filter(Task.HMDB == hmdb) 
+  if (healthy.only) {
+    tmp <- tmp %>% 
+      filter(Healthy) 
+  }
+  tmp <- tmp %>%
+    # Add mean score per feature 
+    group_by(Feature) %>%
+    mutate(Mean.Feat.P = mean(Mean.P), N = n(), N.Signif = sum(Mean.P < 0.1)) %>%
+    ungroup() %>%
+    arrange(-N.Signif, Mean.Feat.P)
+  
+  # Order features by number of times that feature is significant / mean P
+  tmp$Feature <- factor(tmp$Feature, levels = unique(tmp$Feature))
+  
+  # Get additional versions of the table
+  tmp2 <- tmp %>%
+    tidyr::pivot_wider(id_cols = Feature, names_from = Task.Dataset, values_from = Mean.P) 
+  
+  tmp3 <- as.matrix(tmp2[,-1])
+  rownames(tmp3) <- tmp2$Feature
+  
+  return(list(contrib.hmdb = tmp,
+              contrib.hmdb.wide = tmp2,
+              contrib.hmdb.m = tmp3))
+}
+
+# Returns a table with comparison of feature importances between each pair of datasets
+get.feat.importance.comparisons <- function(contrib.hmdb.wide, datasets.ordering) {
+  fi.comparisons <- data.frame(stringsAsFactors = F)
+  
+  # Iterate over pairs of datasets
+  n.datasets <- length(datasets.ordering)
+  for (i in 1:(n.datasets-1)) {
+    for (j in (i+1):n.datasets) {
+      dataset1 <- datasets.ordering[i]
+      dataset2 <- datasets.ordering[j]
+      tmp <- contrib.hmdb.wide[,c("Feature", dataset1, dataset2)]
+      
+      # Add significance flag for Fisher's test
+      tmp <- tmp %>%
+        rename(P.D1 = 2, P.D2 = 3) %>%
+        filter((! is.na(P.D1)) & (! is.na(P.D2))) %>%
+        mutate(Signif.0.05.D1 = (P.D1 <= 0.05)) %>%
+        mutate(Signif.0.05.D2 = (P.D2 <= 0.05)) %>%
+        mutate(Signif.0.1.D1 = (P.D1 <= 0.1)) %>%
+        mutate(Signif.0.1.D2 = (P.D2 <= 0.1))
+      
+      # Calculate several comparison metrics
+      fisher.0.1 <- fisher.test(factor(tmp$Signif.0.1.D1, levels=c("TRUE","FALSE")), factor(tmp$Signif.0.1.D2, levels=c("TRUE","FALSE")))
+      fisher.0.05 <- fisher.test(factor(tmp$Signif.0.05.D1, levels=c("TRUE","FALSE")), factor(tmp$Signif.0.05.D2, levels=c("TRUE","FALSE")))
+      cor.sp <- cor.test(x = tmp$P.D1, y = tmp$P.D2, method = 'spearman')
+      cor.pe <- cor.test(x = tmp$P.D1, y = tmp$P.D2, method = 'pearson')
+      num.feat.sh.0.1 <- sum(tmp$Signif.0.1.D1 & tmp$Signif.0.1.D2)
+      num.feat.sh.0.05 <- sum(tmp$Signif.0.05.D1 & tmp$Signif.0.05.D2)
+      
+      # Weighted correlation - here we give higher weights to more important features 
+      wcor <- wtd.cor(x = tmp$P.D1, y = tmp$P.D2, 
+                      weight = pmax(-log(tmp$P.D1), -log(tmp$P.D2))) 
+      
+      fi.comparisons <- bind_rows(fi.comparisons,
+                                  data.frame(Dataset1 = dataset1,
+                                             Dataset2 = dataset2,
+                                             N.Feat.In.Common = nrow(tmp),
+                                             Cor.Spearman = unname(cor.sp$estimate),
+                                             Cor.Spearman.P = cor.sp$p.value,
+                                             Cor.Pearson = unname(cor.pe$estimate),
+                                             Cor.Pearson.P = cor.pe$p.value,
+                                             W.Cor.Pearson = wcor[1,'correlation'],
+                                             W.Cor.Pearson.P = wcor[1,'p.value'],
+                                             Fisher.0.1.OR = unname(fisher.0.1$estimate),
+                                             Fisher.0.1.P = fisher.0.1$p.value,
+                                             Fisher.0.05.OR = unname(fisher.0.05$estimate),
+                                             Fisher.0.05.P = fisher.0.05$p.value,
+                                             Shared.Feats.0.1 = num.feat.sh.0.1,
+                                             Shared.Feats.0.05 = num.feat.sh.0.05,
+                                             stringsAsFactors = F))
+    }
+  }
+  
+  # Convert datasets to factors according to given order
+  fi.comparisons <- fi.comparisons %>%
+    mutate(Dataset1 = factor(Dataset1, levels = datasets.ordering),
+           Dataset2 = factor(Dataset2, levels = datasets.ordering))
+  
+  return(fi.comparisons)
+}
 
 
+# Returns a table with comparison of feature importances between each pair of datasets,
+#  using adjusted models, where models are re-trained with only features shared between the pair of datasets compared.
+# TODO: merge with function above
+get.adj.feat.importance.comparisons <- function(pairwise.comp.contribs, datasets.ordering, hmdb) {
+  fi.comparisons <- data.frame(stringsAsFactors = F)
+  
+  # Iterate over dataset pairs
+  n.datasets <- length(datasets.ordering)
+  for (i in 1:(n.datasets-1)) {
+    for (j in (i+1):n.datasets) {
+      dataset1 <- datasets.ordering[i]
+      dataset2 <- datasets.ordering[j]
+      
+      # First we get the list of feature scores for each pair of datasets, 
+      #  using the "adjusted" models (where only shared features were considered)
+      tmp1 <- pairwise.comp.contribs %>%
+        ungroup() %>%
+        filter(HMDB == hmdb) %>%
+        filter(Dataset1 == dataset1) %>%
+        filter(Dataset.Aligned.To == dataset2) %>%
+        rename(P.D1 = Mean.P) %>%
+        select(Feature, P.D1) 
+      tmp2 <- pairwise.comp.contribs %>%
+        ungroup() %>%
+        filter(HMDB == hmdb) %>%
+        filter(Dataset1 == dataset2) %>%
+        filter(Dataset.Aligned.To == dataset1) %>%
+        rename(P.D2 = Mean.P) %>%
+        select(Feature, P.D2) 
+      # Merge together
+      tmp <- tmp1 %>%
+        left_join(tmp2, by = "Feature") %>%
+        mutate(Dataset1 = dataset1, Dataset2 = dataset2) %>%
+        # For Fisher's test
+        mutate(Signif.0.05.D1 = (P.D1 <= 0.05)) %>%
+        mutate(Signif.0.05.D2 = (P.D2 <= 0.05)) %>%
+        mutate(Signif.0.1.D1 = (P.D1 <= 0.1)) %>%
+        mutate(Signif.0.1.D2 = (P.D2 <= 0.1))
+      
+      # Calculate several comparison metrics
+      fisher.0.1 <- fisher.test(factor(tmp$Signif.0.1.D1, levels=c("TRUE","FALSE")), factor(tmp$Signif.0.1.D2, levels=c("TRUE","FALSE")))
+      fisher.0.05 <- fisher.test(factor(tmp$Signif.0.05.D1, levels=c("TRUE","FALSE")), factor(tmp$Signif.0.05.D2, levels=c("TRUE","FALSE")))
+      cor.sp <- cor.test(x = tmp$P.D1, y = tmp$P.D2, method = 'spearman')
+      cor.pe <- cor.test(x = tmp$P.D1, y = tmp$P.D2, method = 'pearson')
+      num.feat.sh.0.1 <- sum(tmp$Signif.0.1.D1 & tmp$Signif.0.1.D2)
+      num.feat.sh.0.05 <- sum(tmp$Signif.0.05.D1 & tmp$Signif.0.05.D2)
+      
+      # Weighted correlation - here we give higher weights to more important features 
+      # Weighting option 1: max raw importance (the function normalizes to mean 1)
+      wcor <- wtd.cor(x = tmp$P.D1, y = tmp$P.D2, 
+                      weight = pmax(-log(tmp$P.D1), -log(tmp$P.D2))) 
+      
+      # Organize all stats in one table
+      fi.comparisons <- bind_rows(fi.comparisons,
+                                  data.frame(Dataset1 = dataset1,
+                                             Dataset2 = dataset2,
+                                             N.Feat.In.Common = nrow(tmp),
+                                             Cor.Spearman = unname(cor.sp$estimate),
+                                             Cor.Spearman.P = cor.sp$p.value,
+                                             Cor.Pearson = unname(cor.pe$estimate),
+                                             Cor.Pearson.P = cor.pe$p.value,
+                                             W.Cor.Pearson = wcor[1,'correlation'],
+                                             W.Cor.Pearson.P = wcor[1,'p.value'],
+                                             Fisher.0.1.OR = unname(fisher.0.1$estimate),
+                                             Fisher.0.1.P = fisher.0.1$p.value,
+                                             Fisher.0.05.OR = unname(fisher.0.05$estimate),
+                                             Fisher.0.05.P = fisher.0.05$p.value,
+                                             Shared.Feats.0.1 = num.feat.sh.0.1,
+                                             Shared.Feats.0.05 = num.feat.sh.0.05,
+                                             stringsAsFactors = F))
+    }
+  }
+  
+  # Convert datasets to factors according to given order
+  fi.comparisons <- fi.comparisons %>%
+    mutate(Dataset1 = factor(Dataset1, levels = datasets.ordering),
+           Dataset2 = factor(Dataset2, levels = datasets.ordering))
+  
+  return(fi.comparisons)
+}
+
+# Receives an hmdb id and a contributions table (scores + P's for all features in all analyzed models)
+# Returns a list of features
+get.features.to.include.in.plot <- function(contribs, hmdb, healthy.only = T) {
+  features.to.include <- contribs %>%
+    filter(Task.HMDB == hmdb) %>%
+    filter(Mean.P < 0.1) 
+  if (healthy.only) {
+    features.to.include <- features.to.include %>% 
+      filter(Healthy) 
+  }
+  return(unique(features.to.include$Feature))
+}
+
+plot.ggplot.heatmap.feat.imp2 <- function(contrib.hmdb, features.to.include) {
+  fixed.feat.levels <- levels(contrib.hmdb$Feature)
+  names(fixed.feat.levels) <- levels(contrib.hmdb$Feature)
+  fixed.feat.levels["g__Ruminococcaceae.UCG.013"] <- "g__Ruminococcaceae\nUCG.013"
+  fixed.feat.levels["g__Lachnospiraceae.ND3007.group"] <- "g__Lachnospiraceae\nND3007.group"
+  fixed.feat.levels["g__Erysipelotrichaceae.UCG.003"] <- "g__Erysipelotrichaceae\nUCG.003"
+  fixed.feat.levels["g__Ruminococcaceae.UCG.003"] <- "g__Ruminococcaceae\nUCG.003"
+  fixed.feat.levels["g__Phascolarctobacterium"] <- "g__Phascolarcto-\nbacterium"
+  fixed.feat.levels["g__Lachnospiraceae.NC2004.group"] <- "g__Lachnospiraceae\nNC2004.group"
+  fixed.feat.levels["g__Erysipelatoclostridium"] <- "g__Erysipelato-\nclostridium"
+  fixed.feat.levels["g__Ruminococcaceae.NK4A214.group"] <- "g__Ruminococcaceae\nNK4A214.group"
+  fixed.feat.levels["g__Ruminococcaceae.UCG.010"] <- "g__Ruminococcaceae\nUCG.010"
+  fixed.feat.levels["g__Lachnospiraceae.NK4A136.group"] <- "g__Lachnospiraceae\nNK4A136.group"
+  fixed.feat.levels["g__Lachnospiraceae.UCG.001"] <- "g__Lachnospiraceae\nUCG.001"
+  fixed.feat.levels["g__Family.XIII.AD3011.group"] <- "g__Family.XIII\nAD3011.group"
+  fixed.feat.levels["g__Ruminococcaceae.UCG.002"] <- "g__Ruminococcaceae\nUCG.002"
+  fixed.feat.levels["g__Christensenellaceae.R.7.group"] <- "g__Christensenellaceae\nR.7.group"
+  fixed.feat.levels["g__Ruminococcaceae.UCG.014"] <- "g__Ruminococcaceae\nUCG.014"
+  fixed.feat.levels["g__Ruminococcaceae.UCG.005"] <- "g__Ruminococcaceae\nUCG.005"
+  fixed.feat.levels["g__Escherichia-Shigella"] <- "g__Escherichia-\nShigella"
+  fixed.feat.levels["g__Lachnoclostridium"] <- "g__Lachno-\nclostridium"
+  fixed.feat.levels <- gsub("g__", "", fixed.feat.levels)
+  
+  contrib.hmdb2 <- contrib.hmdb %>%
+    filter(Feature %in% features.to.include) %>%
+    mutate(Feature = factor(Feature, levels = names(fixed.feat.levels),
+                            labels = unname(fixed.feat.levels))) %>%
+    mutate(Mean.P = ifelse(Mean.P > 0.1, NA, Mean.P)) %>%
+    mutate(Mean.P.Signif.Mark = get.signif.marks(Mean.P)) %>%
+    mutate(Mean.P.Signif.Mark = ifelse(Mean.P.Signif.Mark=="^","",Mean.P.Signif.Mark))
+  
+  p <- ggplot(contrib.hmdb2, aes(x = Feature,y = Task.Dataset, color = "")) + 
+    geom_tile(aes(fill = Mean.P)) +
+    scale_fill_gradientn(colors = c("#5f0f40","#C87EAC"),
+                         values = c(0,1),
+                         breaks = c(0.08, 0.05, 0.01, 0.005),
+                         na.value = "gray88") +
+    guides(fill = guide_colourbar(frame.colour = "black", 
+                                  title = "Feature P Value", 
+                                  #barheight = 4,
+                                  reverse = TRUE)) +
+    ylab(NULL) + 
+    xlab(NULL) +
+    theme_bw() +
+    # Dummy scale just to add to legend
+    scale_color_manual(values = NA) +              
+    guides(color = guide_legend("P > 0.1", 
+                                title.vjust = 0.5,
+                                override.aes=list(fill="gray88", color="black"))) +
+    geom_text(aes(label = Mean.P.Signif.Mark), size = 4, color = "black") +
+    theme(axis.text.x = element_text(angle = 90, size = 7, vjust = 0.2, hjust = 1),
+          axis.text.y = element_text(size = 8),
+          legend.position = "bottom",
+          legend.text = element_text(size = 6),
+          legend.title = element_text(size = 9, vjust = 0.8),
+          panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          plot.margin = unit(c(5.5, 0, 5.5, 5.5), "points"))
+  
+  return(p)
+}
 

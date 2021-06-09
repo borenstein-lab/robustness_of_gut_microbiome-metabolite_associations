@@ -1323,10 +1323,10 @@ REM.results <- REM.results %>%
 
 # ----------- Save to files (in order not to recompute) ------------>
 write.table(REM.results, quote = FALSE, sep = "\t", 
-            file = '../data/REM_results.tsv',
+            file = '../data/REM_Results.tsv',
             row.names = FALSE)
 save(full.REM.results, 
-     file = '../data/full_REM_results.RData')
+     file = '../data/Full_REM_Results.RData')
 
 # ---------------------------- Clean up ---------------------------->
 rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, min.num.of.studies.allowed)
@@ -1337,9 +1337,9 @@ rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, min.num.of.studies.allow
 ```{r}
 # --------- Load REM results if it didn't just run ---------->
 if(!exists("REM.results")) {
-  REM.results <- read.delim('../data/REM_results.tsv', 
+  REM.results <- read.delim('../data/REM_Results.tsv', 
                             stringsAsFactors = F)
-  load('../data/full_REM_results.RData')
+  load('../data/Full_REM_Results.RData')
 }
 
 print(paste(n_distinct(REM.results$HMDB),"metabolites were analyzed with REMs"))
@@ -1854,10 +1854,10 @@ REM.subgroup.results$Between.Subgroups.FDR <- p.adjust(REM.subgroup.results$Betw
 
 # ----------- Save to files (in order not to recompute) ------------>
 write.table(REM.subgroup.results, quote = FALSE, sep = "\t", 
-            file = '../data/subgroup_REM_results.tsv',
+            file = '../data/Subgroup_REM_Results.tsv',
             row.names = FALSE)
 save(list = c("subgroup.REM.results","healthy.disease.REM.results"), 
-     file = '../data/full_subgroup_REM_results.RData')
+     file = '../data/Full_Subgroup_REM_Results.RData')
 
 # ---------------------------- Clean up ---------------------------->
 rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, keep.these, tmp.method,  tmp.hakn, tmp.z)
@@ -1868,8 +1868,8 @@ rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, keep.these, tmp.method, 
 ```{r REM_SUBGROUP_ORGANIZE}
 # --------- Load REM results if it didn't just run ---------->
 if(!exists("REM.subgroup.results")) {
-  REM.subgroup.results <- read.delim('../data/subgroup_REM_results.tsv', stringsAsFactors = F)
-  load('../data/full_subgroup_REM_results.RData')
+  REM.subgroup.results <- read.delim('../data/Subgroup_REM_Results.tsv', stringsAsFactors = F)
+  load('../data/Full_Subgroup_REM_Results.RData')
 }
 
 print(paste(n_distinct(REM.subgroup.results$HMDB),"metabolites were analyzed in the subgroup REM analysis"))
@@ -1970,3 +1970,1285 @@ ggplot() +
 rm(tmp, tmp1, tmp2, tmp3, i, tmp.polygons, p.r, l.p.r, u.p.r, y.pos)
 ```
 
+## 10. Models comparison analysis - healthy only
+
+For each metabolite well-predicted 3 or more times we take all healthy datasets that had well-performing models for them.   
+We perform 2 types of analysis:  
+
+(1) Comparison of important features: we first calculate permutation-based feature importance scores for each model included.
+We use the method from the reference below to compute p values for our feature importances (implemented in the ranger package).  
+*Altmann, André, et al. "Permutation importance: a corrected feature importance measure." Bioinformatics 26.10 (2010): 1340-1347.*   
+Different datasets have different sets of features and so we also compare feature importance scores of models after re-training the models so that they only includes features shared by both models compared (we call this the pairwise-adjusted version).   
+
+(2) Pairwise cross-predictability.  
+
+### Feature importance
+
+We re-train one final model (using all samples available) for each metabolite *well-predicted* in each dataset, and analyze its feature contributions using permutation based scores and p values (see reference above).   
+
+As before - we run the pipeline several times for each task in order to check our results stability.   
+
+```{r}
+# Options
+genera.trans.choice = "RELATIVE"
+model.choice = "RF"
+rho.threshold.on.loocv <- 0.3
+p.threshold.on.loocv <- 0.1
+```
+
+
+```{r CONTRIBUTORS_PERMUTATION, eval = FALSE, message=FALSE}
+# Place holder for feature importance
+metab.contributors.Perm <- data.frame(stringsAsFactors = F)
+final.rf.models <- list()
+
+# Iterate over datasets
+for (dataset in datasets.to.train) { 
+  cat("Working on dataset:", dataset, "\n")
+  print(format(Sys.time(), format="%H:%M:%S"))
+  dataset.type <- ifelse(grepl("HEALTHY", dataset), "HEALTHY", "DISEASE")
+  dataset.orig <- gsub("(_HEALTHY)|(_DISEASE)","",dataset)
+  
+  # Get list of metabolites to work on (metabolites with HMDB ID's + well predicted)
+  # Note that we actually collect here feature importances for any well-performing model, but we later limit the analysis to those metabolites well-predicted in 3 datasets at least
+  if (dataset.type == "HEALTHY") { 
+    get.metabs.from.table <- metab.pred.results.sum
+  } else { get.metabs.from.table <- metab.pred.results.dis }
+  metabs.for.training <- get.metabs.from.table %>%
+    filter(Task.Dataset == dataset) %>%
+    filter(Avg.Spearman > rho.threshold.on.loocv) %>%
+    filter(Avg.Spearman.FDR < p.threshold.on.loocv) %>%
+    select(Task.HMDB, Task.Metabolite.Raw) %>%
+    filter(Task.HMDB %in% REM.universal$HMDB)
+  print(paste(nrow(metabs.for.training), "metabolites in this dataset will be analyzed."))
+  if (nrow(metabs.for.training) == 0) {next}
+  
+  # Prepare feature table (genera abundances)
+  genera <- get.feature.table(dataset, 
+                              genera.trans, 
+                              genera.trans.choice)
+      
+  # Iterate over metabolites
+  for (i in 1:nrow(metabs.for.training)) { 
+    cat(".")
+    
+    # Get metabolite name
+    metabolite <- metabs.for.training$Task.Metabolite.Raw[i]
+    metabolite.hmdb <- metabs.for.training$Task.HMDB[i]
+    
+    # Add target variable (metabolite values) to feature table
+    ## Patch: for some reason some trailing white-spaces have been removed in some versions of metabolite name, so we optionally add it back if needed
+    if (! metabolite %in% rownames(mtb.trans$LOG[[dataset]])) { 
+      metabolite <- paste0(metabolite, ' ') 
+    }
+    metab.vector <- 
+      mtb.trans$LOG[[dataset]][metabolite, rownames(genera$dt)]
+    # Scale (zero-mean unit-variance)
+    metab.vector.scaled <- c(scale(metab.vector))
+    dt <- cbind(genera$dt, Metabolite = metab.vector.scaled)
+    
+    # To check how "stable" our pipeline is, we run it <num.runs> times per task
+    for (run in 1:num.runs) { 
+      
+      # Specify model 
+      model <- my.get.model(model.choice, 
+                            rf.importance = "permutation") 
+      
+      # Create workflow object (tidymodels convention)
+      workflow.obj <- my.get.workflow(model)
+      
+      # Specify a "dummy" hyper-parameters grid (default params)
+      hyparam.grid <- my.get.hyperparameter.grid(model.choice, n.features = genera$n, dummy = TRUE)
+      
+      # Train final model using entire train dataset
+      final.model <- 
+        workflow.obj %>% 
+        finalize_workflow(parameters = hyparam.grid) %>% 
+        fit(data = dt)
+      # Save it
+      final.rf.models[[paste(dataset.orig, dataset.type, metabolite.hmdb, run, sep="~")]]
+      
+      # Get permutation-based feature importance
+      feat.importance.Perm <- 
+        data.frame(importance_pvalues(final.model$fit$fit$fit, 
+                                      method = "altmann", 
+                                      formula = Metabolite ~ ., 
+                                      data = dt))
+      names(feat.importance.Perm) <- c("Score", "P.Value")
+      feat.importance.Perm$Feature <- rownames(feat.importance.Perm)
+      rownames(feat.importance.Perm) <- NULL
+      feat.importance.Perm <- feat.importance.Perm %>% arrange(-Score)
+      feat.importance.Perm$Task.Dataset <- dataset
+      feat.importance.Perm$Task.Metabolite.Raw <- metabolite
+      feat.importance.Perm$Task.HMDB <- metabolite.hmdb
+      feat.importance.Perm$Run <- run
+      
+      # Update main results table
+      metab.contributors.Perm <- bind_rows(metab.contributors.Perm, feat.importance.Perm)
+    } # Done iterating over runs
+  } # Done iterating over metabs
+} # Done iterating over datasets
+
+# Save results to file
+write.table(metab.contributors.Perm,
+          file = '../data/Permutation_Feature_Importances.tsv',
+          row.names = FALSE, sep = "\t", quote = FALSE)
+
+# Clean up
+rm(dataset, i, metabolite, genera.trans.choice, dt, metab.vector, model.choice, genera, workflow.obj, model, metabs.for.training, run, hyparam.grid, final.model, tmp.warnings, get.metabs.from.table, dataset.type, dataset.orig, feat.importance.Perm)
+```
+
+#### Organize raw results
+
+Load results.  
+
+```{r message = FALSE}
+metab.contributors.Perm <- read_delim("../data/Permutation_Feature_Importances.tsv", 
+    "\t", escape_double = FALSE, trim_ws = TRUE)
+
+# If results include datasets no longer relevant, remove them now
+metab.contributors.Perm <- metab.contributors.Perm %>%
+  filter(Task.Dataset %in% datasets.to.train) %>%
+  filter(Task.HMDB %in% common.HMDBs)
+
+print("Loaded contribution analysis results from file")
+```
+
+Aggregate results over runs.  
+
+```{r}
+# Average importance scores / p values over runs for final ranks
+contribs <- metab.contributors.Perm %>%
+  # Only universal
+  filter(Task.HMDB %in% REM.universal$HMDB) %>%
+  # Average scores over runs
+  group_by(Task.Dataset, Task.Metabolite.Raw, Task.HMDB, Feature) %>%
+  summarise(N.sanity.5 = n(), Mean.Score = mean(Score), Mean.P = mean(P.Value), Var.P = var(P.Value), .groups = "drop") %>%
+  # Add ranks
+  group_by(Task.Dataset, Task.Metabolite.Raw, Task.HMDB) %>%
+  mutate(Feat.Rank = rank(Mean.P)) %>%
+  ungroup() %>%
+  left_join(metabolite.stats[,c("HMDB","Compound.Name")], 
+            by = c("Task.HMDB" = "HMDB")) %>%
+  mutate(Healthy = grepl("HEALTHY", Task.Dataset))
+
+# Here we create a list of metabolites to further look into in the context of comparing models (i.e. only metabolites well-predicted in at least 3 individual studies)
+metabs.for.contrib.analysis <- unique(contribs %>%
+                           filter(Healthy) %>%
+                           group_by(Task.HMDB) %>%
+                           filter(n_distinct(Task.Dataset) >= 3) %>%
+                           ungroup() %>%
+                           pull(Task.HMDB))
+
+print(paste("We analyze contribution comparison for", 
+            length(metabs.for.contrib.analysis),
+            "metabolites that were well-predicted 3 or more times and universal"))
+
+rm(metab.contributors.Perm)
+```
+
+### Cross-predictability & pairwise-adjusted contributors
+
+For the cross-predictability analysis we down-sample the larger dataset to the size of the smaller dataset.  
+
+TODO: current code runs some redundant model training tasks. Need to re-organize and make efficient.  
+
+```{r PAIRWISE_HC_CONTRIBS_CROSS_PREDS, warning=FALSE, eval=FALSE}
+metab.contributors2 <- data.frame(stringsAsFactors = F)
+cross.pred.results2 <- data.frame(stringsAsFactors = F)
+
+for (tmp.hmdb in metabs.for.contrib.analysis) { 
+  tmp.metab.name <- metabolite.stats$Compound.Name[metabolite.stats$HMDB == tmp.hmdb]
+  cat("\n"); print(paste("Analyzing:", tmp.metab.name))
+  
+  # Get names of datasets where this metabolite was well-predicted to begin with
+  relevant.datasets <- unique(contribs %>% filter((Task.HMDB == tmp.hmdb) & Healthy) %>% pull(Task.Dataset))
+  
+  for (flag.re.normalize in c(TRUE)) { 
+    print(paste(ifelse(flag.re.normalize,"With","Without"), "re-normalizing"))
+    
+    # TODO: re-organize. 
+    for (flag.down.sample in c(FALSE, TRUE)) { 
+      
+      # Iterate over pairs of datasets
+      for (i in 1:length(relevant.datasets)) { 
+        for (j in 1:length(relevant.datasets)) { 
+          if (i == j) next;
+          cat(i, "&", j)
+          dataset1 <- relevant.datasets[i]
+          dataset2 <- relevant.datasets[j]
+          
+          raw.metab.name1 <- metab.pred.results.sum %>% filter(Task.Dataset == dataset1 & Task.HMDB == tmp.hmdb) %>% pull(Task.Metabolite.Raw)
+          raw.metab.name2 <- metab.pred.results.sum %>% filter(Task.Dataset == dataset2 & Task.HMDB == tmp.hmdb) %>% pull(Task.Metabolite.Raw)
+          
+          # Prepare feature table (genera abundances)
+          genera1 <- get.feature.table(dataset1, genera.trans, genera.trans.choice)
+          genera2 <- get.feature.table(dataset2, genera.trans, genera.trans.choice)
+          
+          # Get only shared features
+          shared.genera.feats <- intersect(colnames(genera1$dt), colnames(genera2$dt))
+          dt1 <- genera1$dt[,shared.genera.feats]
+          dt2 <- genera2$dt[,shared.genera.feats]
+          
+          # Re-normalize to relative abundances if needed
+          if (flag.re.normalize) {
+            dt1 <- decostand(dt1, method = "total", MARGIN = 1)
+            dt2 <- decostand(dt2, method = "total", MARGIN = 1)
+          }
+          
+          # Sample sizes
+          n1 <- nrow(dt1)
+          n2 <- nrow(dt2)
+            
+          # Add target variable (metabolite values) to dataset 1 feature table
+          # Patch: for some reason some trailing white-spaces have been removed in some versions of metabolite name, so we optionally add it back if needed
+          if (! raw.metab.name1 %in% rownames(mtb.trans$LOG[[dataset1]])) {raw.metab.name1 <- paste0(raw.metab.name1, ' ')}
+          metab.vector <- mtb.trans$LOG[[dataset1]][raw.metab.name1, rownames(dt1)]
+          metab.vector.scaled <- c(scale(metab.vector)) # Scale
+          dt1 <- cbind(dt1, Metabolite = metab.vector.scaled)
+          
+          # Add target variable - dataset 2
+          if (! raw.metab.name2 %in% rownames(mtb.trans$LOG[[dataset2]])) {raw.metab.name2 <- paste0(raw.metab.name2, ' ')}
+          metab.vector <- mtb.trans$LOG[[dataset2]][raw.metab.name2, rownames(dt2)]
+          metab.vector.scaled <- c(scale(metab.vector)) # Scale
+          dt2 <- cbind(dt2, Metabolite = metab.vector.scaled)
+          
+          # For longitudinal datasets, get a named vector that will serve as a map between sample names to subject names
+          # If the dataset is not longitudinal, the map is from sample name to sample name. (so it can be effectively treated the same)
+          # --> dataset1
+          sample.to.subject1 <- get.sample.to.subject(dataset1, metadatas, mtb.trans)
+          
+          # --> dataset2
+          sample.to.subject2 <- get.sample.to.subject(dataset2, metadatas, mtb.trans)
+          
+          # To check how "stable" our pipeline is, we run it X times per task
+          for (run in 1:10) { 
+            cat('.')
+            # If needed, subsample larger study group to match size of smaller study group (ds = down-sampled)
+            if (flag.down.sample) {
+              n.min <- min(n1, n2)
+              dt1.ds <- dt1[sample(x = n1, size = n.min),]
+              dt2.ds <- dt2[sample(x = n2, size = n.min),]
+            } else {
+              dt1.ds <- dt1
+              dt2.ds <- dt2
+            }
+            
+            # Update mappings sample to subject
+            tmp.sample.to.subject1 <- sample.to.subject1[names(sample.to.subject1) %in% rownames(dt1.ds)]
+            tmp.sample.to.subject2 <- sample.to.subject2[names(sample.to.subject2) %in% rownames(dt2.ds)]
+            tmp.unique.subjects1 <- unique(unname(tmp.sample.to.subject1))
+            
+            # Train predictor for dataset1
+            model <- my.get.model(model.choice, rf.importance = "permutation")
+            workflow.obj <- my.get.workflow(model)
+            hyparam.grid <- my.get.hyperparameter.grid(model.choice, n.features = length(shared.genera.feats), dummy = TRUE)
+            
+            # Collect CV performance metrics 
+            loocv.preds <- foreach(ii = 1:length(tmp.unique.subjects1), 
+                                         .combine = rbind, 
+                                         .packages = c('tidymodels')) %dopar% { 
+              tmp.samples.to.test.on <- names(tmp.sample.to.subject1)[tmp.sample.to.subject1 == tmp.unique.subjects1[ii]]
+              tmp.trained.model <- workflow.obj %>% 
+                finalize_workflow(parameters = hyparam.grid) %>% 
+                fit(data = dt1.ds[! rownames(dt1.ds) %in% tmp.samples.to.test.on,])
+              my.predict(tmp.trained.model, dt1.ds[sample(tmp.samples.to.test.on, 1),])
+            }
+            loocv.results <- my.get.metrics(loocv.preds)
+            names(loocv.results) <- paste0("loocv.", names(loocv.results))
+        
+            # Now train final model using entire train dataset
+            final.model <- 
+              workflow.obj %>% 
+              finalize_workflow(parameters = hyparam.grid) %>% 
+              fit(data = dt1.ds)
+            
+            if (flag.down.sample) {
+              # Get predictions on test data (dataset2)
+              test.preds <- my.predict(final.model, dt2.ds)
+          
+              # Calculate test performance (for longitudinal datasets, we pick here one sample per subject)
+              tmp.sample.to.subject2 <- sample(tmp.sample.to.subject2)
+              tmp.sample.to.subject2 <- tmp.sample.to.subject2[! duplicated(tmp.sample.to.subject2)]
+              test.preds <- test.preds[names(tmp.sample.to.subject2),]
+              test.performance <- my.get.metrics(test.preds)
+              
+              # Extract previous performance metrics on train set using cv (for later sanity)
+              prev.loocv.results1 <- metab.pred.results.sum %>%
+                filter(Task.Dataset == dataset1 & Task.HMDB == tmp.hmdb)  
+              prev.loocv.results2 <- metab.pred.results.sum %>%
+                filter(Task.Dataset == dataset2 & Task.HMDB == tmp.hmdb)
+              
+              cross.pred.results2 <- bind_rows(cross.pred.results2,
+                                               data.frame(Compound.Name = tmp.metab.name,
+                                                          HMDB = tmp.hmdb,
+                                                          Dataset1 = dataset1,
+                                                          Dataset2 = dataset2,
+                                                          N.features1 = genera1$n,
+                                                          N.features2 = genera2$n,
+                                                          N.shared.features = length(shared.genera.feats),
+                                                          # Numbers before down-sampling
+                                                          N.samples1 = n1,
+                                                          N.unique.subjects1 = n_distinct(sample.to.subject1),
+                                                          N.samples2 = n2,
+                                                          N.unique.subjects2 = n_distinct(sample.to.subject2),
+                                                          Re.normalized = flag.re.normalize,
+                                                          Down.sampled = flag.down.sample,
+                                                          Run = run,
+                                                          Prev.Spearman.rho.cv1 = 
+                                                             prev.loocv.results1$Avg.Spearman,
+                                                          Prev.Spearman.fdr.cv1 = 
+                                                             prev.loocv.results1$Avg.Spearman.FDR,
+                                                          Prev.Spearman.rho.cv2 = 
+                                                             prev.loocv.results2$Avg.Spearman,
+                                                          Prev.Spearman.fdr.cv2 = 
+                                                             prev.loocv.results2$Avg.Spearman.FDR,
+                                                          # Updated results using LOOCV on dataset1
+                                                          New.Spearman.rho.cv1 = 
+                                                             loocv.results$loocv.spearman.rho,
+                                                          New.Spearman.p.cv1 = 
+                                                             loocv.results$loocv.spearman.p,
+                                                          # Cross-prediction results on dataset2
+                                                          New.Spearman.rho.cp2 = 
+                                                             test.performance$spearman.rho,
+                                                          New.Spearman.p.cp2 = 
+                                                             test.performance$spearman.p,
+                                                          stringsAsFactors = FALSE))
+            }
+            
+            # Now get permutation-based feature importance for dataset1 (aligned to dataset2)
+            if (run < 6 & ! flag.down.sample) {
+              # Get permutation-based feature importance
+              feat.importance.Perm <- data.frame(importance_pvalues(final.model$fit$fit$fit, method = "altmann", formula = Metabolite ~ ., data = dt1.ds))
+              names(feat.importance.Perm) <- c("Score","P.Value")
+              feat.importance.Perm$Feature <- rownames(feat.importance.Perm)
+              rownames(feat.importance.Perm) <- NULL
+              feat.importance.Perm <- feat.importance.Perm %>% arrange(-Score)
+              feat.importance.Perm$Dataset1 <- dataset1
+              feat.importance.Perm$Dataset.Aligned.To <- dataset2
+              feat.importance.Perm$Compound.Name <- tmp.metab.name
+              feat.importance.Perm$HMDB <- tmp.hmdb
+              feat.importance.Perm$Run <- run
+              feat.importance.Perm$Re.normalized <- flag.re.normalize
+              feat.importance.Perm$Down.sampled <- flag.down.sample
+              
+              # Update table with summarized feature importance adjusted to shared features
+              metab.contributors2 <- bind_rows(metab.contributors2, feat.importance.Perm)
+            }
+          } # Done iterating over runs 
+        } # Done iterating over dataset2
+      } # Done iterating over dataset1
+    }
+  }
+} # Done iterating over metabolites
+
+write_delim(cross.pred.results2, 
+            path = '../data/Pairwise_Cross_Pred_Results.tsv',
+            delim = "\t")
+write_delim(metab.contributors2, 
+            path = '../data/Pairwise_Contrib_Results.tsv',
+            delim = "\t")
+
+# Clean up
+rm(tmp.hmdb, tmp.metab.name, relevant.datasets, flag.re.normalize, flag.down.sample, 
+   i, j, dataset1, dataset2, raw.metab.name1, raw.metab.name2, genera1, genera2, 
+   shared.genera.feats, dt1, dt2, n1, n2, run, 
+   metab.vector, metab.vector.scaled, n.min, dt1.ds, dt2.ds,
+   model, workflow.obj, hyparam.grid, loocv.preds, loocv.results,
+   final.model, test.preds, test.performance, prev.loocv.results1, prev.loocv.results2,
+   rf.explainer, rf.vip, rf.vip.sum)
+```
+
+#### Organize results
+
+```{r LOAD_PAIRWISE_H_CONTRIBS_CROSS_PREDS, warning=FALSE, message=FALSE}
+pairwise.comp.cross.pred <- read_delim("../data/Pairwise_Cross_Pred_Results.tsv", 
+    "\t", escape_double = FALSE, trim_ws = TRUE)
+
+# (Without downsampling)
+pairwise.comp.contribs <- read_delim("../data/Pairwise_Contrib_Results.tsv", 
+    "\t", escape_double = FALSE, trim_ws = TRUE)
+
+# If results include datasets no longer relevant, remove them now
+pairwise.comp.cross.pred <- pairwise.comp.cross.pred %>%
+  filter(Dataset1 %in% datasets.to.train) %>%
+  filter(Dataset2 %in% datasets.to.train) 
+
+pairwise.comp.contribs <- pairwise.comp.contribs %>%
+  filter(Dataset1 %in% datasets.to.train) %>%
+  filter(Dataset.Aligned.To %in% datasets.to.train) 
+
+# Take only universal + >3 well-performing models (redundant)
+pairwise.comp.cross.pred <- pairwise.comp.cross.pred %>%
+  filter(HMDB %in% metabs.for.contrib.analysis) 
+pairwise.comp.contribs <- pairwise.comp.contribs %>%
+  filter(HMDB %in% metabs.for.contrib.analysis) 
+
+# Use only down-sampled version for cross-preds analysis
+pairwise.comp.cross.pred <- pairwise.comp.cross.pred %>%
+  filter(Down.sampled)
+
+# Sanity / basic stats
+print(paste(length(unique(pairwise.comp.cross.pred$HMDB)), "metabolites were analyzed for pairwise comparisons of models"))
+```
+
+Average over runs.
+
+```{r}
+pairwise.comp.contribs <- pairwise.comp.contribs %>%
+  group_by(HMDB, Compound.Name, 
+           Re.normalized, Down.sampled, 
+           Dataset1, Dataset.Aligned.To, Feature) %>%
+  summarise(Mean.Score = mean(Score), 
+            Mean.P = mean(P.Value),
+            .groups = "drop") %>%
+  group_by(HMDB, Compound.Name, 
+           Re.normalized, Down.sampled, 
+           Dataset1, Dataset.Aligned.To) %>%
+  mutate(Feat.Rank = rank(-Mean.Score)) 
+```
+
+```{r}
+pairwise.comp.cross.pred <- pairwise.comp.cross.pred %>%
+  group_by(HMDB, Compound.Name, 
+           Re.normalized, Down.sampled, 
+           Dataset1, Dataset2, 
+           N.features1, N.features2, 
+           N.shared.features, N.samples1, N.samples2,
+           Prev.Spearman.rho.cv1, Prev.Spearman.fdr.cv1, 
+           Prev.Spearman.rho.cv2, Prev.Spearman.fdr.cv2) %>%
+  summarise(N.sanity.5 = n(),
+            New.Spearman.rho.cv1 = mean(New.Spearman.rho.cv1),
+            New.Spearman.p.cv1 = mean(New.Spearman.p.cv1),
+            New.Spearman.rho.cp2 = mean(New.Spearman.rho.cp2),
+            New.Spearman.p.cp2 = mean(New.Spearman.p.cp2),
+            .groups = "drop") 
+
+# Now also add FDR corrections, at the dataset level (so over all metabolites and paired datasets)
+pairwise.comp.cross.pred <- pairwise.comp.cross.pred %>%
+  group_by(Re.normalized, Down.sampled, Dataset1) %>%
+  mutate(New.Spearman.fdr.cv1 = p.adjust(New.Spearman.p.cv1, method="fdr")) %>%
+  ungroup() %>%
+  group_by(Re.normalized, Down.sampled, Dataset2) %>%
+  mutate(New.Spearman.fdr.cp2 = p.adjust(New.Spearman.p.cp2, method="fdr")) %>%
+  ungroup()
+```
+
+
+#### For down-sampled models: filter only those still well-performing
+
+For the cross-predictability analysis we discard models that after down-sampling did no longer perform well, using our "well-predicted" definition.  
+
+```{r}
+tmp <- pairwise.comp.cross.pred %>%
+  filter(New.Spearman.rho.cv1 > rho.threshold & New.Spearman.fdr.cv1 <= fdr.threshold)
+
+print(paste(nrow(tmp),"of",
+            nrow(pairwise.comp.cross.pred),
+            "models trained are still well-performing after (possible) down-sampling"))
+print(paste("Overall",n_distinct(tmp$HMDB),"of",
+            n_distinct(pairwise.comp.cross.pred$HMDB),
+            "metabolites are included in downstream analyses"))
+
+pairwise.comp.cross.pred <- tmp
+rm(tmp)
+```
+
+#### Define well-transfered models
+
+```{r}
+# We add a flag column with indication of "Well.Transferred"
+pairwise.comp.cross.pred <- pairwise.comp.cross.pred %>%
+  mutate(Well.Transferred = (New.Spearman.rho.cp2 > rho.threshold & New.Spearman.fdr.cp2 <= fdr.threshold))
+
+print(paste(sum(pairwise.comp.cross.pred$Well.Transferred),"of",
+            nrow(pairwise.comp.cross.pred),
+            "models were well-transfered from one dataset to another"))
+
+# We create another table version where we summarize cross-predictability results per dataset pair
+# (each pair appears twice, in both train-test directions)
+pairwise.comp.cross.pred2 <- pairwise.comp.cross.pred %>%
+  select(HMDB, Dataset1, Dataset2, Well.Transferred)
+pairwise.comp.cross.pred2 <- bind_rows(pairwise.comp.cross.pred2 %>%
+                                         mutate(Flipped = F),
+                                       # Flip direction
+                                       pairwise.comp.cross.pred2 %>%
+                                         rename(DatasetT = Dataset1) %>%
+                                         rename(Dataset1 = Dataset2) %>%
+                                         rename(Dataset2 = DatasetT) %>%
+                                         mutate(Flipped = T))
+pairwise.comp.cross.pred2 <- pairwise.comp.cross.pred2 %>%
+  group_by(HMDB, Dataset1, Dataset2) %>%
+  summarise(N.Rows = n(), 
+            N.Well.Transferred = sum(Well.Transferred), # 2 = well-transferred in both directions, 1 = one direction
+            .groups = "drop") 
+```
+
+### Organize pairwise dataset comparisons
+
+Here we collect several stats about how similar/consistent feature importances are, based on pairwise comparisons of models for each metabolite. These stats include:  
+
+* Spearman correlation on importance scores (p values) of shared feature  
+* Pearson correlation -"-  
+* Fisher's exact test on significant features in each set (P<0.05/P<0.1)
+* Number of features that are significant in both datasets (of shared features only, so that we don't "punish" for small overlaps of features)  
+
+```{r CONTRIBS_COMPARISONS, warning=FALSE}
+feat.importance.pairwise.comps <- data.frame(stringsAsFactors = F)
+adj.feat.importance.pairwise.comps <- data.frame(stringsAsFactors = F)
+
+for(tmp.hmdb in metabs.for.contrib.analysis) { 
+  tmp.metab.name <- metabolite.stats$Compound.Name[metabolite.stats$HMDB == tmp.hmdb]
+  
+  # Organize contribution results for the specific metabolite (few different versions of the table)
+  tmp <- get.hmdb.contribs(contribs, tmp.hmdb)
+  contrib.hmdb.wide <- tmp$contrib.hmdb.wide
+  ds.ordering <- unique(tmp$contrib.hmdb$Task.Dataset)
+  
+  # Analyze similarity between datasets using a few different methods
+  feat.imp.comps <- get.feat.importance.comparisons(contrib.hmdb.wide, datasets.ordering = ds.ordering)
+  feat.imp.comps$HMDB = tmp.hmdb
+  feat.imp.comps$Compound.Name = tmp.metab.name
+  feat.importance.pairwise.comps <- bind_rows(feat.importance.pairwise.comps, feat.imp.comps)
+  
+  # Same as above, but this time with "adjusted" models 
+  #  (for each pairwise comparison, only features shared by both models were used for training and for feature importance calculations)
+  adj.feat.imp.comps <- get.adj.feat.importance.comparisons(pairwise.comp.contribs, datasets.ordering = ds.ordering, hmdb = tmp.hmdb)
+  adj.feat.imp.comps$HMDB = tmp.hmdb
+  adj.feat.imp.comps$Compound.Name = tmp.metab.name
+  adj.feat.importance.pairwise.comps <- bind_rows(adj.feat.importance.pairwise.comps, adj.feat.imp.comps)
+}
+
+feat.importance.pairwise.comps <- feat.importance.pairwise.comps %>%
+  mutate(Pairwise.Adjusted = FALSE)
+adj.feat.importance.pairwise.comps <- adj.feat.importance.pairwise.comps %>%
+  mutate(Pairwise.Adjusted = TRUE)
+feat.importance.pairwise.comps <- bind_rows(feat.importance.pairwise.comps, adj.feat.importance.pairwise.comps)
+
+# Clean up
+rm(tmp.hmdb, tmp.metab.name, tmp, contrib.hmdb.wide, feat.imp.comps, adj.feat.imp.comps, adj.feat.importance.pairwise.comps)
+```
+
+### Summarize at metabolite level
+
+```{r}
+# Aggregate stats per metabolite (and per adjusted/non-adjusted models)
+feat.importance.stats <- feat.importance.pairwise.comps %>%
+  group_by(HMDB, Compound.Name, Pairwise.Adjusted) %>%
+  # (WP = weighted pearson)
+  summarise(N.pairwise.comparisons = n(),
+            Spearman.Cor.Min = min(Cor.Spearman),
+            Spearman.Cor.Max = max(Cor.Spearman),
+            Spearman.Cor.Med = median(Cor.Spearman),
+            Spearman.Cor.Avg = mean(Cor.Spearman),
+            Spearman.Cor.Std = sd(Cor.Spearman),
+            Spearman.Cor.Signif = sum(Cor.Spearman > 0 & Cor.Spearman.P <= 0.1),
+            OR.0.1.Signif = sum(Fisher.0.1.OR > 1 & Fisher.0.1.P <= 0.1),
+            OR.0.05.Signif = sum(Fisher.0.05.OR > 1 & Fisher.0.05.P <= 0.1),
+            Shared.Feats.0.1.Min = min(Shared.Feats.0.1),
+            Shared.Feats.0.1.Max = max(Shared.Feats.0.1),
+            Shared.Feats.0.1.Med = median(Shared.Feats.0.1),
+            Shared.Feats.0.1.Avg = mean(Shared.Feats.0.1),
+            Shared.Feats.0.1.Std = sd(Shared.Feats.0.1),
+            Shared.Feats.0.05.Min = min(Shared.Feats.0.05),
+            Shared.Feats.0.05.Max = max(Shared.Feats.0.05),
+            Shared.Feats.0.05.Med = median(Shared.Feats.0.05),
+            Shared.Feats.0.05.Avg = mean(Shared.Feats.0.05),
+            Shared.Feats.0.05.Std = sd(Shared.Feats.0.05),
+            Shared.Feats.Avg = mean(N.Feat.In.Common),
+            Shared.Feats.Std = sd(N.Feat.In.Common),
+            .groups="drop") 
+
+tmp.mtb.ordering <- feat.importance.stats %>%
+  filter(! Pairwise.Adjusted) %>%
+  arrange(Spearman.Cor.Med) %>%
+  pull(Compound.Name)
+
+feat.importance.stats <- feat.importance.stats %>%
+  mutate(Compound.Name = factor(Compound.Name, levels = tmp.mtb.ordering))
+
+# Add stats about known contributing genera
+# feat.importance.stats <- feat.importance.stats %>%
+#   left_join(contributors.counts %>% select(-Compound.Name), by = "HMDB")
+
+rm(tmp.mtb.ordering)
+```
+
+### Plot - contributors comparison overview
+
+Plot statistics of shared significant and overall features:
+
+```{r fig.width=9, fig.height=3.6}
+category1 <- "Average no. of shared features\n(over dataset pairs)"
+category2 <- "Average no. of significant contributors\n(over single datasets)"
+category3 <- "Average no. of shared significant contributors\n(over dataset pairs)"
+
+dt.category1 <- feat.importance.stats %>%
+    filter(! Pairwise.Adjusted) %>%
+    select(Compound.Name, N.pairwise.comparisons, 
+           Shared.Feats.Avg, Shared.Feats.Std) %>%
+    mutate(Category = category1) %>%
+    rename(Average = Shared.Feats.Avg, Std = Shared.Feats.Std) 
+
+dt.category2 <- contribs %>% 
+    filter(Task.HMDB %in% feat.importance.stats$HMDB) %>%
+    group_by(Task.Dataset, Compound.Name) %>% 
+    summarise(Significant.Contributors.0.1 = sum(Mean.P<0.1), .groups="drop") %>%
+    group_by(Compound.Name) %>%
+    summarise(Average = mean(Significant.Contributors.0.1), 
+              Std = sd(Significant.Contributors.0.1), .groups="drop") %>%
+    mutate(Category = category2)
+
+dt.category3 <- feat.importance.stats %>%
+    filter(! Pairwise.Adjusted) %>%
+    select(Compound.Name, N.pairwise.comparisons, 
+           Shared.Feats.0.1.Avg, Shared.Feats.0.1.Std) %>%
+    mutate(Category = category3) %>%
+    rename(Average = Shared.Feats.0.1.Avg, Std = Shared.Feats.0.1.Std) %>%
+  arrange(-Average)
+
+tmp <- bind_rows(dt.category1, dt.category2, dt.category3)
+tmp$Category <- factor(tmp$Category, levels = c(category1, category2, category3))
+tmp$Compound.Name <- factor(tmp$Compound.Name, levels = dt.category3$Compound.Name)
+
+# Plot customizations
+cols.map <- c("grey","#0f4c5c","#C87EAC")
+names(cols.map) <- c(category1, category2, category3)
+point.sizes.map <- c(2,2,5.5)
+names(point.sizes.map) <- c(category1, category2, category3)
+
+ggplot(tmp, aes(x = Compound.Name, y = Average, color = Category)) +
+  geom_errorbar(aes(ymin = Average-Std, ymax = Average+Std),
+                position = position_dodge(0.3), 
+                width = 0.7) +
+  geom_point(aes(size = Category), position = position_dodge(0.3)) +
+  scale_size_manual(values = point.sizes.map) +
+  scale_color_manual(values = cols.map) +
+  geom_text(data = dt.category3, 
+            mapping = aes(label = round(Average,1), 
+                          x = Compound.Name, y = Average),
+            size = 2.4, color = "black", nudge_x = 0.1, nudge_y = 0.1) +
+  xlab(NULL) +
+  ylab("Number of features") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, size = 8, hjust = 1, vjust = 0.3),
+        legend.position = "top", 
+        legend.title = element_blank(),
+        legend.text = element_text(size = 8),
+        legend.box.margin=margin(-10,-10,-10,-10)
+        ) 
+
+rm(tmp, category1, category2, category3, dt.category1, dt.category2, dt.category3)
+```
+
+### Stats 
+
+```{r}
+n.agree.at.least.once <- nrow(feat.importance.stats %>% 
+                                filter(! Pairwise.Adjusted) %>% 
+                                filter(Spearman.Cor.Signif > 0))
+print(paste(n.agree.at.least.once,
+            "of", nrow(feat.importance.stats %>% 
+                         filter(! Pairwise.Adjusted)),
+            "metabolites exhibit a significant Spearman correlation between feature P values of different datasets at least once"))
+
+print(paste("Similarily, using pairwise-adjusted models, we get",
+           nrow(feat.importance.stats %>% filter(Pairwise.Adjusted) %>% filter(Spearman.Cor.Signif > 0)), 
+           "metabolites"))
+
+print("Metabolites vary in how well do genera feature P values correlate between any pair of datasets, on average. Examples of low avergae correlation and high average correlation:")
+
+feat.importance.stats %>%
+  filter(! Pairwise.Adjusted) %>%
+  select(Compound.Name, Pairwise.Adjusted, 
+         N.pairwise.comparisons, 
+         Spearman.Cor.Avg, Spearman.Cor.Std, 
+         Shared.Feats.0.1.Avg, Shared.Feats.0.1.Std) %>%
+  filter(Spearman.Cor.Avg <= 0.05, Spearman.Cor.Std < 0.2) %>%
+  kable() %>%
+  kable_styling(font_size = 9) %>%
+  column_spec(1, background = "orange")
+
+feat.importance.stats %>%
+  filter(! Pairwise.Adjusted) %>%
+  select(Compound.Name, Pairwise.Adjusted, 
+         N.pairwise.comparisons, 
+         Spearman.Cor.Avg, Spearman.Cor.Std, 
+         Shared.Feats.0.1.Avg, Shared.Feats.0.1.Std) %>%
+  filter(Spearman.Cor.Avg >= 0.25) %>%
+  kable() %>%
+  kable_styling(font_size = 9) %>%
+  column_spec(1, background = "orange")
+
+rm(n.agree.at.least.once)
+```
+
+### Plot per metabolite
+
+We plot heatmaps of feature importance scores per metabolite, pairwise pearson correlations between feature importance scores (p values), and a matrix of cross-prediction results (where the model was trained on the column-dataset and tested on the row-dataset).   
+
+In the cross-prediction matrix, empty cells mean that the trained model after downsampling did not perform well.  
+
+```{r CONTRIBS_COMPARISONS_VIZ, fig.width=6.9, fig.height=3.4}
+all.cp.plots <- list()
+all.fic.plots <- list()
+
+for(tmp.metab.name in levels(feat.importance.stats$Compound.Name)) { # tmp.metab.name = "Taurine"
+  tmp.hmdb <- metabolite.stats$HMDB[metabolite.stats$Compound.Name == tmp.metab.name]
+  
+  # Get list of features to include in plot
+  features.to.include <- get.features.to.include.in.plot(contribs, tmp.hmdb)
+  
+  # Organize contribution results for the specific metabolite 
+  tmp <- get.hmdb.contribs(contribs, tmp.hmdb)
+  contrib.hmdb <- tmp$contrib.hmdb
+  ds.ordering <- unique(contrib.hmdb$Task.Dataset)
+  contrib.hmdb <- contrib.hmdb %>% 
+    mutate(Task.Dataset = factor(Task.Dataset, levels = ds.ordering,
+                                 labels = substr(ds.ordering,1,2)))
+  
+  # Order features as above (TODO: can be more elegant)
+  tmp.order <- match(levels(contrib.hmdb$Feature), features.to.include)
+  tmp.order <- tmp.order[!is.na(tmp.order)]
+  features.to.include <- features.to.include[tmp.order]
+  
+  # Get main heatmap plot
+  p1 <- plot.ggplot.heatmap.feat.imp2(contrib.hmdb, features.to.include)
+  #p1 <- p1 + theme(plot.margin = unit(c(5.5, 0, main.marg.bottom, 5.5), "points"))
+  
+  # Plot summarized statistics - pearson comparisons and cross-predictability
+  feat.imp.comps <- feat.importance.pairwise.comps %>%
+    filter(HMDB == tmp.hmdb) %>%
+    filter(! Pairwise.Adjusted) %>%
+    mutate(Dataset1 = factor(Dataset1, levels = ds.ordering)) %>%
+    mutate(Dataset2 = factor(Dataset2, levels = ds.ordering)) %>%
+    select(Dataset1, Dataset2, Cor.Spearman, Cor.Spearman.P, Compound.Name) %>%
+    mutate(tmp.FDR = p.adjust(Cor.Spearman.P, method = "fdr")) %>%
+    mutate(Significance = get.signif.marks(tmp.FDR)) 
+  
+  # Plot summarized statistics - cross-predictability
+  tmp <- pairwise.comp.cross.pred %>%
+    filter(HMDB == tmp.hmdb) %>%
+    mutate(Dataset1 = factor(Dataset1, levels = ds.ordering,
+                             labels = substr(ds.ordering,1,2))) %>%
+    mutate(Dataset2 = factor(Dataset2, levels = ds.ordering,
+                             labels = substr(ds.ordering,1,2))) %>% 
+    tidyr::complete(Dataset1, Dataset2) %>%
+    mutate(Significance.cp2 = get.signif.marks(New.Spearman.fdr.cp2)) %>%
+    select(Dataset1, Dataset2, 
+           New.Spearman.rho.cp2, New.Spearman.fdr.cp2, 
+           Significance.cp2, Well.Transferred) %>%
+    mutate(p.label.cp = ifelse(is.na(New.Spearman.rho.cp2), 
+                               "", 
+                               paste("CP:\n",round(New.Spearman.rho.cp2,2), 
+                                     Significance.cp2)))  # CP = Cross-predictability
+    
+  p3 <- ggplot(tmp, aes(x = Dataset1, y = Dataset2, fill = Well.Transferred)) + 
+    geom_tile(color = "black") + 
+    geom_text(aes(label=p.label.cp), size = 2) +
+    geom_abline(slope = -1, intercept = length(ds.ordering)+1) +
+    xlab("Trained on") + 
+    ylab("Tested on") + 
+    theme_classic() + 
+    scale_y_discrete(position = "right") +
+    scale_x_discrete(limits = rev(substr(ds.ordering,1,2))) +
+    scale_fill_manual(values = c("TRUE" = "#C52E2B", "FALSE" = "gray88")) +
+    ggtitle(tmp.metab.name) + 
+    theme(axis.text.x = element_text(angle = 90, size = 9, 
+                                     hjust = 1, vjust = 0.3), 
+          axis.text.y = element_text(size = 9),
+          axis.title = element_text(size = 9),
+          legend.position = "none", #"top",
+          #legend.text = element_text(size=6),
+          plot.title = element_text(hjust=0.5, size = 10),
+          plot.margin = unit(c(0,0,0.1,-0.07), "cm"))
+  all.cp.plots[[tmp.metab.name]] <- p3 
+  
+  # Plot summarized statistics - correlation between feature p values
+  tmp <- feat.imp.comps %>% 
+    select(Dataset1, Dataset2, Cor.Spearman, Significance) %>%
+    mutate(Dataset1 = factor(Dataset1, levels = ds.ordering,
+                             labels = substr(ds.ordering,1,2))) %>%
+    mutate(Dataset2 = factor(Dataset2, levels = ds.ordering,
+                             labels = substr(ds.ordering,1,2))) %>% 
+    tidyr::complete(Dataset2) %>%
+    mutate(p.label.fic = ifelse(is.na(Cor.Spearman), 
+                                "", 
+                                paste("FIC:\n",
+                                      round(Cor.Spearman, 2), 
+                                      Significance))) # FIC = Feature Importance Correlation
+  
+  p4 <- ggplot(tmp, aes(x = Dataset1, y = Dataset2, 
+                        fill = (Significance==""))) + 
+    geom_tile(color = "black") + 
+    geom_text(aes(label=p.label.fic), size = 2) +
+    geom_abline(slope = -1, intercept = length(ds.ordering)+1) +
+    xlab("Dataset 1") + 
+    ylab("Dataset 2") + 
+    theme_classic() + 
+    scale_y_discrete(position = "right") +
+    scale_x_discrete(limits = rev(substr(ds.ordering,1,2))) +
+    scale_fill_manual(values = c("FALSE" = "#C52E2B", "TRUE" = "gray88")) +
+    ggtitle(tmp.metab.name) + 
+    theme(axis.text.x = element_text(angle = 90, size = 9, 
+                                     hjust = 1, vjust = 0.3), 
+          axis.text.y = element_text(size = 9),
+          legend.position = "none", #"top",
+          #legend.text = element_text(size=6),
+          axis.title = element_text(size = 9),
+          plot.title = element_text(hjust=0.5, size = 10),
+          plot.margin = unit(c(0,0,0.1,-0.07), "cm"))
+  all.fic.plots[[tmp.metab.name]] <- p4 
+  
+  print(p1 + ggtitle(tmp.metab.name))
+  #grid.arrange(p1 + ggtitle(""), p3, widths = c(0.65, 0.35), 
+  #             top = paste(tmp.hmdb, "~", tmp.metab.name))
+}
+
+rm(tmp.hmdb, tmp.metab.name, features.to.include, 
+   tmp, contrib.hmdb, tmp.order, feat.imp.comps, p1, p3, p4)
+```
+
+#### CP plots
+
+```{r fig.width=13, fig.height=17}
+do.call("grid.arrange", c(all.cp.plots, ncol=6))
+```
+
+#### FIC plots
+
+```{r fig.width=13, fig.height=17, warning=FALSE}
+do.call("grid.arrange", c(all.fic.plots, ncol=6))
+```
+
+### Consistent genera contributors 
+
+We next generate, per metabolite, a list of genera that were consistently significantly important (P<0.1) across all models in which they appeared.
+
+```{r}
+consistent.contributors <- contribs %>%
+  filter(Healthy) %>%
+  group_by(Compound.Name, Task.HMDB) %>%
+  mutate(N.Models = n_distinct(Task.Dataset)) %>%
+  filter(N.Models >= 3) %>%
+  group_by(Compound.Name, Task.HMDB, N.Models, Feature) %>%
+  summarise(N.models.including.genus = n(),
+            N.models.in.which.P.below.0.1 = 
+              paste0(sum(Mean.P < 0.1),' [',round(100*sum(Mean.P < 0.1)/n(),1),'%]'),
+            Perc.P.0.1 = 100*sum(Mean.P < 0.1)/n(),
+            .groups = "drop") %>%
+  filter(N.models.including.genus >= 3) %>%
+  filter(Perc.P.0.1 > 50) %>%
+  rename(HMDB = Task.HMDB) %>%
+  arrange(Compound.Name)
+
+print(paste("We identify",nrow(consistent.contributors),
+            "consistent contributors, to",n_distinct(consistent.contributors$HMDB),"distinct metabolites"))
+
+consistent.contributors %>%
+  select(-Perc.P.0.1, -HMDB, -N.Models) %>%
+  kable() %>%
+  kable_styling(font_size = 10)
+```
+
+## 11. Healthy vs. disease
+
+### Get cross-predictability
+
+Now, for each relevant study we check how well does a model trained on healthy subjects predict metabolite levels in disease. We record these cross-predictability results.    
+We run this for universal metabolites only. 
+
+```{r PAIRWISE_HC_DISEASE, warning = FALSE, eval = FALSE}
+cross.pred.results3 <- data.frame(stringsAsFactors = F)
+genera.trans.choice <- "RELATIVE"
+model.choice <- "RF"
+
+# Iterate over relevant studies
+for (dataset.orig in c("FRANZOSA_IBD", "KIM_ADENOMAS", "SINHA_CRC", "YACHIDA_CRC", "iHMP_IBD")) { 
+  print(paste("Working on dataset:", dataset.orig))
+  print(format(Sys.time(), format="%H:%M:%S"))
+  dataset.h.full <- paste(dataset.orig, "HEALTHY", sep = "_")
+  dataset.d.full <- paste(dataset.orig, "DISEASE", sep = "_")
+      
+  # Get list of metabolites to work on + previous performance results 
+  #  (metabolites well predicted in healthy according to previous analysis)
+  prev.loocv.results <- metab.pred.results.all %>%
+    filter(grepl(dataset.orig, Task.Dataset)) %>%
+    group_by(Task.Metabolite.Raw) %>%
+    filter(n() == 2) %>%
+    ungroup() %>%
+    filter(Task.HMDB %in% REM.universal$HMDB) %>%
+    inner_join(metab.pred.results.sum %>%
+                 filter(grepl(dataset.orig, Task.Dataset)) %>%
+                 filter(Avg.Spearman >= rho.threshold.on.loocv) %>%
+                 filter(Avg.Spearman.FDR <= p.threshold.on.loocv) %>%
+                 select(Task.Metabolite.Raw, Task.HMDB, Compound.Name, Pipe.ID),
+               by = c("Task.Metabolite.Raw","Task.HMDB", "Compound.Name", "Pipe.ID"))
+  
+  metabs.for.training <- prev.loocv.results %>%
+    select(Task.HMDB, Task.Metabolite.Raw) %>%
+    distinct()
+  print(paste(nrow(metabs.for.training), "metabolites in this dataset will be analyzed.")) 
+  
+  if (nrow(metabs.for.training) == 0) {next}
+
+   # Prepare feature table (genera abundances)
+  genera.full <- get.feature.table(dataset.orig, 
+                                   genera.trans, 
+                                   genera.trans.choice)
+  
+  # Iterate over metabolites
+  for (i in 1:nrow(metabs.for.training)) { # i = 3
+    cat('.')
+    # Get metabolite name
+    metabolite <- metabs.for.training$Task.Metabolite.Raw[i]
+    metabolite.hmdb <- metabs.for.training$Task.HMDB[i]
+    
+    # Add target variable (metabolite values) to feature table (for training)
+    ## Patch: for some reason some trailing white-spaces have been removed in some versions of metabolite name, so we optionally add it back if needed
+    if (! metabolite %in% rownames(mtb.trans$LOG[[dataset.orig]])) { 
+      metabolite2 <- paste0(metabolite, ' ') 
+    } else { metabolite2 <- metabolite }
+    metab.vector <- mtb.trans$LOG[[dataset.orig]][metabolite2, rownames(genera.full$dt)]
+    # Scale (zero-mean unit-variance)
+    metab.vector.scaled <- c(scale(metab.vector))
+    dt.full <- cbind(genera.full$dt, Metabolite = metab.vector.scaled)
+  
+    # Get samples for train (healthy) and test (disease)
+    samples.for.training <- 
+      colnames(genera.trans[[genera.trans.choice]][[dataset.h.full]])
+    samples.for.testing <- 
+      colnames(genera.trans[[genera.trans.choice]][[dataset.d.full]])
+    dt.train <- dt.full[samples.for.training,]
+    dt.test <- dt.full[samples.for.testing,]
+    n.train <- length(samples.for.training)
+    n.test <- length(samples.for.testing)
+            
+    # For longitudinal datasets, get a named vector that will serve as a map between sample names to subject names
+    # If the dataset is not longitudinal, the map is from sample name to sample name. (so it can be effectively treated the same)
+    sample.to.subject <- get.sample.to.subject(dataset.orig, metadatas, mtb.trans)
+    
+    # Run a few times to verify stability
+    for (run in 1:10) { # run = 1
+    
+      # Subsample larger study group to match size of smaller study group
+      if (n.train > n.test) {
+        dt.train2 <- dt.train[sample(x = n.train, n.test),]
+        dt.test2 <- dt.test
+      } else if (n.train < n.test) {
+        dt.train2 <- dt.train
+        dt.test2 <- dt.test[sample(x = n.test, n.train),]
+      }
+            
+      # Update mappings of sample to subject
+      tmp.sample.to.subject.h <- sample.to.subject[names(sample.to.subject) %in% rownames(dt.train2)]
+      tmp.sample.to.subject.d <- sample.to.subject[names(sample.to.subject) %in% rownames(dt.test2)]
+      tmp.unique.subjects.h <- unique(unname(tmp.sample.to.subject.h))
+      tmp.unique.subjects.d <- unique(unname(tmp.sample.to.subject.d))
+            
+      # Train predictor for healthy dataset (we train from scratch for cases where down-sampling was performed)
+      model <- my.get.model(model.choice)
+      workflow.obj <- my.get.workflow(model)
+      hyparam.grid <- my.get.hyperparameter.grid(model.choice, n.features = genera.full$n, dummy = TRUE)
+      
+      # Collect CV performance metrics - healthy
+      loocv.preds <- foreach(ii = 1:length(tmp.unique.subjects.h), 
+                                   .combine = rbind, 
+                                   .packages = c('tidymodels')) %dopar% { # ii=5
+        tmp.samples.to.test.on <- names(tmp.sample.to.subject.h)[tmp.sample.to.subject.h == tmp.unique.subjects.h[ii]]
+        tmp.trained.model <- workflow.obj %>% 
+          finalize_workflow(parameters = hyparam.grid) %>% 
+          fit(data = dt.train2[! rownames(dt.train2) %in% tmp.samples.to.test.on,])
+        my.predict(tmp.trained.model, dt.train2[sample(tmp.samples.to.test.on, 1),])
+      }
+      loocv.results <- my.get.metrics(loocv.preds)
+      names(loocv.results) <- paste0("loocv.", names(loocv.results))
+
+      # Now train final model using entire train dataset
+      final.model <- 
+        workflow.obj %>% 
+        finalize_workflow(parameters = hyparam.grid) %>% 
+        fit(data = dt.train2)
+      
+      # Get predictions on test data (dataset2)
+      test.preds <- my.predict(final.model, dt.test2)
+      
+      # Calculate test performance (for longitudinal datasets, we pick here one sample per subject)
+      tmp.sample.to.subject.d2 <- sample(tmp.sample.to.subject.d) # Shuffle
+      tmp.sample.to.subject.d2 <- tmp.sample.to.subject.d2[! duplicated(tmp.sample.to.subject.d2)] # Take first sample per subject
+      test.preds <- test.preds[names(tmp.sample.to.subject.d2),]
+      test.performance <- my.get.metrics(test.preds)
+      
+      # Get performance loocv performance for disease dataset (in cases downsampling occured, these should be lower than previous results)
+      # Collect CV performance metrics - healthy
+      dis.loocv.preds <- foreach(ii = 1:length(tmp.unique.subjects.d), 
+                                   .combine = rbind, 
+                                   .packages = c('tidymodels')) %dopar% { # ii=5
+        tmp.samples.to.test.on <- names(tmp.sample.to.subject.d)[tmp.sample.to.subject.d == tmp.unique.subjects.d[ii]]
+        tmp.trained.model <- workflow.obj %>% 
+          finalize_workflow(parameters = hyparam.grid) %>% 
+          fit(data = dt.test2[! rownames(dt.test2) %in% tmp.samples.to.test.on,])
+        my.predict(tmp.trained.model, dt.test2[sample(tmp.samples.to.test.on, 1),])
+      }
+      dis.loocv.results <- my.get.metrics(dis.loocv.preds)
+      names(dis.loocv.results) <- paste0("loocv.", names(dis.loocv.results))
+      
+      # Finally, extract previous performance metrics on healthy+disease set using cv (for later sanity)
+      prev.loocv.results.h <- prev.loocv.results %>%
+        filter(Task.Dataset == dataset.h.full & 
+                 Task.Metabolite.Raw == metabolite)  
+      prev.loocv.results.d <- prev.loocv.results %>%
+        filter(Task.Dataset == dataset.d.full & 
+                 Task.Metabolite.Raw == metabolite)
+      
+      cross.pred.results3 <- bind_rows(cross.pred.results3,
+                                       data.frame(Original.Dataset = dataset.orig,
+                                                  Compound.Name = prev.loocv.results.h$Compound.Name,
+                                                  HMDB = metabolite.hmdb,
+                                                  Raw.Metabolite.Name = metabolite,
+                                                  # Numbers before down-sampling
+                                                  N.Samples.Healthy = n.train,
+                                                  N.Samples.Disease = n.test,
+                                                  N.Unique.Subjects1.DS = n_distinct(tmp.sample.to.subject.h),
+                                                  N.Unique.Subjects2.DS = n_distinct(tmp.sample.to.subject.d2),
+                                                  Run = run,
+                                                  # Previous results
+                                                  Prev.Spearman.rho.CV.Healthy = 
+                                                     prev.loocv.results.h$Avg.Spearman,
+                                                  Prev.Spearman.fdr.CV.Healthy = 
+                                                     prev.loocv.results.h$Avg.Spearman.FDR,
+                                                  Prev.Spearman.rho.CV.Disease = 
+                                                     prev.loocv.results.d$Avg.Spearman,
+                                                  Prev.Spearman.fdr.CV.Disease = 
+                                                     prev.loocv.results.d$Avg.Spearman.FDR,
+                                                  # New results
+                                                  New.Spearman.rho.CV.Healthy = 
+                                                     loocv.results$loocv.spearman.rho,
+                                                  New.Spearman.p.CV.Healthy = 
+                                                     loocv.results$loocv.spearman.p,
+                                                  New.Spearman.rho.CV.Disease = 
+                                                     dis.loocv.results$loocv.spearman.rho,
+                                                  New.Spearman.p.CV.Disease = 
+                                                     dis.loocv.results$loocv.spearman.p,
+                                                  New.Spearman.rho.Cross.Pred = 
+                                                     test.performance$spearman.rho,
+                                                  New.Spearman.p.Cross.Pred = 
+                                                     test.performance$spearman.p,
+                                                  stringsAsFactors = FALSE))
+
+    } # Done iterating over runs
+  } # Done iterating over metabolites
+} # Done iterating over datasets
+
+# Save
+write_delim(cross.pred.results3, 
+            path = '../data/Pairwise_Cross_Pred_Results_Healthy_Disease.tsv',
+            delim = "\t")
+
+# Clean up
+rm(dataset.orig, dataset.h.full, dataset.d.full, prev.loocv.results, metabs.for.training, i, metabolite, 
+   metabolite.hmdb, metabolite2, metab.vector, metab.vector.scaled, dt.full, samples.for.training, 
+   samples.for.testing, dt.train, dt.test, n.train, n.test, sample.to.subject, run, dt.train2, dt.test2, 
+   tmp.sample.to.subject.h, tmp.sample.to.subject.d, tmp.unique.subjects.h, model, workflow.obj, hyparam.grid, 
+   loocv.preds, ii, tmp.samples.to.test.on, tmp.trained.model, loocv.results, final.model, test.preds, 
+   test.performance, prev.loocv.results.h, prev.loocv.results.d)
+```
+
+### Organize results
+
+Load results, verify the number of analyzed metabolites is as expected.   
+We remove all cases where the healthy model was no longer well-predicting the metabolite (this happened in cases where the control group was larger than the case group and was therefor downsampled).
+
+```{r LOAD_PAIRWISE_H_VS_D_CONTRIBS_CROSS_PREDS, warning=FALSE, message=FALSE}
+pairwise.cp.h.vs.d.raw <- read_delim("../data/Pairwise_Cross_Pred_Results_Healthy_Disease.tsv", 
+    "\t", escape_double = FALSE, trim_ws = TRUE)
+
+pairwise.cp.h.vs.d <- pairwise.cp.h.vs.d.raw %>%
+  group_by(Original.Dataset, 
+           Compound.Name, HMDB, 
+           N.Samples.Healthy, N.Samples.Disease,
+           Prev.Spearman.rho.CV.Healthy, Prev.Spearman.fdr.CV.Healthy, Prev.Spearman.rho.CV.Disease, Prev.Spearman.fdr.CV.Disease) %>%
+  summarise(Spearman.rho.CV.Healthy = mean(New.Spearman.rho.CV.Healthy), 
+            Spearman.p.CV.Healthy = mean(New.Spearman.p.CV.Healthy),
+            Spearman.rho.CV.Disease = mean(New.Spearman.rho.CV.Disease), 
+            Spearman.p.CV.Disease = mean(New.Spearman.p.CV.Disease),
+            Spearman.rho.Cross.Pred = mean(New.Spearman.rho.Cross.Pred),
+            Spearman.p.Cross.Pred = mean(New.Spearman.p.Cross.Pred),
+            .groups="drop") %>%
+  group_by(Original.Dataset) %>%
+  mutate(Spearman.FDR.CV.Healthy = p.adjust(Spearman.p.CV.Healthy, 
+                                            method = "fdr"),
+         Spearman.FDR.Cross.Pred = p.adjust(Spearman.p.Cross.Pred, 
+                                            method = "fdr"),
+         Spearman.FDR.CV.Disease = p.adjust(Spearman.p.CV.Disease, 
+                                            method = "fdr")) %>%
+  ungroup() %>%
+  filter(Spearman.FDR.CV.Healthy < fdr.threshold & 
+           Spearman.rho.CV.Healthy > rho.threshold.on.loocv) 
+
+# Sanity / basic stats
+print(paste(nrow(pairwise.cp.h.vs.d), "metabolites were analyzed (", n_distinct(pairwise.cp.h.vs.d$HMDB),
+            "distinct ) for healthy-to-disease transferability, in", n_distinct(pairwise.cp.h.vs.d$Original.Dataset), "datasets"))
+print("These are the number of metabolites analyzed per dataset:")
+print(table(pairwise.cp.h.vs.d$Original.Dataset))
+```
+
+
+### Visualize cross-predictability
+
+Per metabolite we visualize all the 2X2 matrices of performance results. (The plot is divided into 2).
+
+```{r fig.width=7.6, fig.height=11}
+# Organize data for plotting
+tmp <- bind_rows(
+  # 1 - H --> H
+  pairwise.cp.h.vs.d %>%
+    select(Original.Dataset, HMDB, Compound.Name, Prev.Spearman.rho.CV.Healthy, Prev.Spearman.fdr.CV.Healthy, 
+           Spearman.rho.CV.Healthy, Spearman.FDR.CV.Healthy) %>%
+    rename(Prev.Rho = Prev.Spearman.rho.CV.Healthy) %>%
+    rename(Prev.FDR = Prev.Spearman.fdr.CV.Healthy) %>%
+    rename(New.Rho = Spearman.rho.CV.Healthy) %>%
+    rename(New.FDR = Spearman.FDR.CV.Healthy) %>%
+    mutate(Trained.On = "HEALTHY", Tested.On = "HEALTHY"),
+  # 2 - H --> D
+  pairwise.cp.h.vs.d %>%
+    select(Original.Dataset, HMDB, Compound.Name, Spearman.rho.Cross.Pred, Spearman.FDR.Cross.Pred) %>%
+    mutate(Prev.Rho = NA) %>%
+    mutate(Prev.FDR = NA) %>%
+    rename(New.Rho = Spearman.rho.Cross.Pred) %>%
+    rename(New.FDR = Spearman.FDR.Cross.Pred) %>%
+    mutate(Trained.On = "HEALTHY", Tested.On = "DISEASE"),
+  # 3 - D --> D
+  pairwise.cp.h.vs.d %>%
+    select(Original.Dataset, HMDB, Compound.Name, Prev.Spearman.rho.CV.Disease, Prev.Spearman.fdr.CV.Disease, 
+           Spearman.rho.CV.Disease, Spearman.FDR.CV.Disease) %>%
+    rename(Prev.Rho = Prev.Spearman.rho.CV.Disease) %>%
+    rename(Prev.FDR = Prev.Spearman.fdr.CV.Disease) %>%
+    rename(New.Rho = Spearman.rho.CV.Disease) %>%
+    rename(New.FDR = Spearman.FDR.CV.Disease) %>%
+    mutate(Trained.On = "DISEASE", Tested.On = "DISEASE"))
+
+tmp <- tmp %>%
+  mutate(Spearman.bin = cut(New.Rho, c(-1, 0.3, 0.5, 0.7, 1), right = F)) %>%
+  mutate(Spearman.bin = plyr::revalue(Spearman.bin, 
+                                      c("[-1,0.3)"="< 0.3", 
+                                        "[0.7,1)"="> 0.7"))) %>%
+  mutate(Tested.On = factor(Tested.On, levels = c("HEALTHY","DISEASE"), labels = c("H","D"))) %>%
+  mutate(Trained.On = factor(Trained.On, levels = c("DISEASE","HEALTHY"), labels = c("D","H"))) %>%
+  mutate(Significance = get.signif.marks(New.FDR)) %>%
+  mutate(Color.Category = ifelse(New.FDR <= fdr.threshold & New.Rho >= rho.threshold, "Well-predicted", "Not well-predicted"))
+
+# %>% mutate(Compound.Name2 = ifelse(HMDB %in% REM.universal$HMDB, paste(Compound.Name, "(U)"), Compound.Name))
+
+# Only plot metabs that appear in 2 or more datasets
+tmp2 <- tmp %>%
+  group_by(HMDB) %>%
+  filter(n_distinct(Original.Dataset) >= 2) %>%
+  ungroup()
+
+n.metabs <- n_distinct(tmp2$HMDB)
+metabs.first.half <- unique(tmp2$HMDB)[1:ceiling(n.metabs/2)]
+
+# Add newlines to some metabolite names just to get a more narrow plot
+tmp2$Compound.Name[tmp2$Compound.Name == "2-Hydroxy-3-methylpentanoic acid"] <- "2-Hydroxy-3-methyl-\npentanoic acid"
+tmp2$Compound.Name[tmp2$Compound.Name == "Asymmetric dimethylarginine"] <- "Asymmetric\ndimethylarginine"
+tmp2$Compound.Name[tmp2$Compound.Name == "Docosapentaenoic acid (22n-6)"] <- "Docosapentaenoic\nacid (22n-6)"
+tmp2$Compound.Name[tmp2$Compound.Name == "N6,N6,N6-Trimethyl-L-lysine"] <- "N6,N6,N6-Trimethyl-\nL-lysine"
+#tmp2$Compound.Name[tmp2$Compound.Name == "xxx"] <- "xxx"
+
+# Plot (1st half)
+ggplot(tmp2 %>% filter(HMDB %in% metabs.first.half), aes(y = Trained.On, x = Tested.On)) +
+  geom_tile(aes(fill = Color.Category), color = "black") +
+  geom_text(aes(label = paste(round(New.Rho, 2), Significance)), size = 3) +
+  scale_fill_manual("Spearman rho",
+                    values = c("Not well-predicted" = "grey",
+                               "Well-predicted" = "#EF3B2C"),
+                    na.value="white") +
+  theme_classic() +
+  ylab("Group trained on") +
+  xlab("Group tested on") +
+  facet_grid(Compound.Name ~ Original.Dataset) +
+  theme(strip.text.y = element_text(size = 8, angle = 0, hjust = 0),
+        strip.text.x = element_text(size = 8),
+        axis.text = element_text(size = 9),
+        legend.title = element_blank())
+```
+
+```{r fig.width=6.5, fig.height=11}
+# Plot (2nd half)
+ggplot(tmp2 %>% filter(! HMDB %in% metabs.first.half), aes(y = Trained.On, x = Tested.On)) +
+  geom_tile(aes(fill = Color.Category), color = "black") +
+  geom_text(aes(label = paste(round(New.Rho, 2), Significance)), size = 3) +
+  scale_fill_manual("Spearman rho",
+                    values = c("Not well-predicted" = "grey",
+                               "Well-predicted" = "#EF3B2C"),
+                    na.value="white") +
+  theme_classic() +
+  ylab("Group trained on") +
+  xlab("Group tested on") +
+  facet_grid(Compound.Name ~ Original.Dataset) +
+  theme(strip.text.y = element_text(size = 8, angle = 0, hjust = 0),
+        strip.text.x = element_text(size = 8),
+        axis.text = element_text(size = 9),
+        legend.title = element_blank())
+
+rm(tmp, tmp2, metabs.first.half, n.metabs)
+```
+
+### Contributors comparisons per metabolite
+
+```{r CONTRIBS_COMPARISONS_VIZ_H_VS_D, fig.width=4.9, fig.height=2.7}
+all.plots <- list()
+i <- 0
+
+for (tmp.metab.name in sort(unique(pairwise.cp.h.vs.d$Compound.Name))) { # tmp.metab.name = "Malonic acid"
+  tmp.hmdb <- pairwise.cp.h.vs.d$HMDB[pairwise.cp.h.vs.d$Compound.Name == tmp.metab.name][1]
+  tmp.datasets <- unique(pairwise.cp.h.vs.d %>% filter(Compound.Name == tmp.metab.name) %>% pull(Original.Dataset))
+  
+  for (dataset in tmp.datasets) { # dataset = "FRANZOSA_IBD"
+    # Get list of features to include in plot
+    features.to.include <- get.features.to.include.in.plot(contribs %>% 
+                                                             filter(grepl(dataset, Task.Dataset)), 
+                                                           tmp.hmdb, healthy.only = F)
+    
+    # Organize contribution results for the specific metabolite 
+    tmp <- get.hmdb.contribs(contribs %>% filter(grepl(dataset, Task.Dataset)), tmp.hmdb, healthy.only = FALSE)
+    contrib.hmdb <- tmp$contrib.hmdb
+    contrib.hmdb <- contrib.hmdb %>% 
+      mutate(Task.Dataset = factor(Task.Dataset, levels = c(paste0(dataset, "_DISEASE"),paste0(dataset, "_HEALTHY")),
+                                 labels = c("DISEASE","HEALTHY")))
+    
+    if (n_distinct(contrib.hmdb$Task.Dataset) < 2) {print(paste("Skipping",tmp.metab.name,"in",dataset, "(was not well-predicted in disease)")); next}
+    
+    # Order features as above (TODO: can be more elegant)
+    tmp.order <- match(levels(contrib.hmdb$Feature), features.to.include)
+    tmp.order <- tmp.order[!is.na(tmp.order)]
+    features.to.include <- features.to.include[tmp.order]
+      
+    # Get main heatmap plot
+    p1 <- plot.ggplot.heatmap.feat.imp2(contrib.hmdb, features.to.include)
+    p1 <- p1 + 
+      ggtitle(paste0(tmp.metab.name, " [Dataset: ", dataset, "]")) +
+      theme(plot.title = element_text(size = 11))
+    # g1 <- ggplot_gtable(data = ggplot_build(plot = p1))
+    # grid.newpage()
+    # grid.draw(g1)
+    # print(p1)
+    i <- i+1
+    all.plots[[i]] <- p1
+  }
+} 
+
+all.plots.2 <- align_plots(plotlist = all.plots, align="h")
+
+for (i in 1:length(all.plots.2)) { print(ggdraw(all.plots.2[[i]])) }
+
+rm(tmp.hmdb, tmp.metab.name, dataset, tmp.datasets, features.to.include, tmp, contrib.hmdb, tmp.order, p1, all.plots, all.plots.2, i)
+```
+
+
+## SessionInfo
+
+```{r}
+sessionInfo()
+```

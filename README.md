@@ -29,16 +29,16 @@ root
 |-- data                                # all the data used for the anlaysis including intermediate data
 |   |-- Processed_Data_29092020.RData   # processed microbiome-metabolome datasets from 10 studies
 |   |-- Combined_Metabolome_Predictability_Results.tsv                             # intermediate results from various machine learning pipelines per dataset per metabolite
-|   |-- REM_results.tsv                 # a processed table with all REM model results
-|   |-- full_REM_results.RData          # raw REM model results
+|   |-- REM_Results.tsv                 # a processed table with all REM model results
+|   |-- Full_REM_Results.RData          # raw REM model results
 |   |-- MelonnPan_supp_table_3_withHMDB.xlsx   # Table related to Mallick et al. 2019
 |   |-- Zierer_et_al_2018               # files related to Zierer et al. 2018 
-|   |-- subgroup_REM_results.tsv        # a processed table with all subgroup-REM model results
-|   |-- full_subgroup_REM_results.RData # raw subgroup-REM model results
-|   |-- 
-|   |-- 
-|   |-- 
-|   |-- 
+|   |-- Subgroup_REM_Results.tsv        # a processed table with all subgroup-REM model results
+|   |-- Full_Subgroup_REM_Results.RData # raw subgroup-REM model results
+|   |-- Permutation_Feature_Importances.tsv
+|   |-- Pairwise_Contrib_Results.tsv
+|   |-- Pairwise_Cross_Pred_Results.tsv
+|   |-- Pairwise_Cross_Pred_Results_Healthy_Disease.tsv
 |-- README.md
 ```
 
