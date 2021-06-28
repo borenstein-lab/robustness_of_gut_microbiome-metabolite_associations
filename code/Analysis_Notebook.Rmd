@@ -1,5 +1,5 @@
 ---
-title: "Analysis Notebook: A meta-analysis study of the universality of gut microbiome-metabolome associations"
+title: "Analysis Notebook: A meta-analysis study of the robustness of gut microbiome-metabolome associations"
 output:
   html_document:
     css: Custom_Formatting.css
@@ -900,6 +900,67 @@ print(paste("Moreover,", sum(pred.per.metabolite$Count.Well.Predicted > 1),
             "metabolites were well-predicted 4 times or more."))
 ```
 
+#### Compare to a shuffled version
+
+```{r}
+pred.per.metabolite.shuff <- data.frame(stringsAsFactors = F)
+set.seed(21573)
+
+for (i in 1:1000) {
+  if(i%%10==0) cat('.')
+  if(i%%100==0) cat('|')
+  
+  tmp <- metab.pred.results.sum %>%
+    filter(Task.HMDB %in% common.HMDBs.healthy) %>%
+    mutate(well.predicted = Avg.Spearman > rho.threshold & Avg.Spearman.FDR < fdr.threshold) %>%
+    select(Task.Dataset, Task.HMDB, well.predicted) %>%
+    group_by(Task.Dataset) %>% 
+    mutate(well.predicted = sample(well.predicted))
+  
+  pred.per.metabolite.shuff <- bind_rows(pred.per.metabolite.shuff,
+                                         tmp %>%
+                                           # Summarize shuffled stats per metabolite
+                                           group_by(Task.HMDB) %>%
+                                           summarise(N.Datasets = n_distinct(Task.Dataset),
+                                                     Count.Well.Predicted = sum(well.predicted),
+                                                     .groups = "drop") %>%
+                                           mutate(Shuffle.id = i))
+}
+cat('\n')
+
+pred.per.metabolite.shuff.sum <- pred.per.metabolite.shuff %>%
+  group_by(Shuffle.id) %>%
+  summarise(Num.Well.Predicted.At.Least.Once = sum(Count.Well.Predicted > 0),
+            Num.Well.Predicted.At.Least.2 = sum(Count.Well.Predicted > 1),
+            Num.Well.Predicted.At.Least.3 = sum(Count.Well.Predicted > 2),
+            Num.Well.Predicted.At.Least.4 = sum(Count.Well.Predicted > 3),
+            Num.Never.Well.Predicted = sum(Count.Well.Predicted == 0))
+
+print("Results of shuffled version:")
+print("No. metabolites well-predicted at least once:")
+print(paste("Average =",mean(pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.Once)))
+quantile(x = pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.Once, probs = c(0, 0.025, 0.5, 0.975, 1))
+
+print("No. metabolites well-predicted at least twice:")
+print(paste("Average =",mean(pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.2)))
+quantile(x = pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.2, probs = c(0, 0.025, 0.5, 0.975, 1))
+
+print("No. metabolites well-predicted at least 3 times:")
+print(paste("Average =",mean(pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.3)))
+quantile(x = pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.3, probs = c(0, 0.025, 0.5, 0.975, 1))
+
+print("No. metabolites well-predicted at least 4 times:")
+print(paste("Average =",mean(pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.4)))
+quantile(x = pred.per.metabolite.shuff.sum$Num.Well.Predicted.At.Least.4, probs = c(0, 0.025, 0.5, 0.975, 1))
+
+print("No. metabolites never well-predicted:")
+print(paste("Average =",mean(pred.per.metabolite.shuff.sum$Num.Never.Well.Predicted)))
+quantile(x = pred.per.metabolite.shuff.sum$Num.Never.Well.Predicted, probs = c(0, 0.025, 0.5, 0.975, 1))
+
+rm(tmp, i, pred.per.metabolite.shuff, pred.per.metabolite.shuff.sum)
+```
+
+
 ### Statistics per healthy dataset
 
 Note: sample counts are those after our processing, including the downsampling of longitudinal datasets.  
@@ -1345,6 +1406,126 @@ if(!exists("REM.results")) {
 print(paste(n_distinct(REM.results$HMDB),"metabolites were analyzed with REMs"))
 ```
 
+
+#### Shuffled version (null hypothesis)
+
+We use the same REM calculations, this time on shuffled versions of the data where metabolite names within each study are shuffled. We compare the number of robustly well-predicted results to the original number.  
+
+```{r REM_CALCULATIONS_SHUFFLED, eval=FALSE}
+# ------------------ Settings and preparations --------------------->
+min.num.of.studies.allowed <- 3
+studies.to.include <- unique(metab.pred.results.sum$Task.Dataset)
+
+# First we get all metabolites (+ pipe settings) we want to analyze
+REM.settings <- metab.pred.results.sum %>%
+  select(Task.HMDB, Compound.Name) %>%
+  distinct() %>%
+  # We add REM setting options (dummy - we take only the settings reported in paper)
+  mutate(REM.Tau.Method = "DL") %>%
+  mutate(REM.Z.Trans = "ZCOR") %>%
+  mutate(REM.HAKN.Adjust = FALSE)
+
+REM.results.shuffled <- data.frame(stringsAsFactors = FALSE)
+
+for (shuff.id in 1:1000) {
+  # Track progress
+  cat('.')
+  if(shuff.id%%100==0) cat(shuff.id,'\n')
+  
+  ###############
+  ## SHUFFLING ##
+  ###############
+  tmp.shuff.metab.pred.results <- metab.pred.results.sum %>%
+    filter(Compound.Name %in% unique(pred.per.metabolite$Compound.Name)) %>% # We want the total to be 273 metabolites as above
+    group_by(Task.Dataset) %>%
+    mutate(Compound.Name = sample(Compound.Name))
+  
+  # ----------------- Iterate over each metabolite ------------------->
+  # For each compound calculate the random effects model.
+  tmp <- foreach (i = 1:nrow(REM.settings), 
+                          .combine=rbind,
+                          .packages = c('dplyr', 'meta', 'DescTools')) %do% { 
+  
+    tmp.compound.name <- REM.settings$Compound.Name[i]
+    tmp.method <- REM.settings$REM.Tau.Method[i]
+    tmp.z <- REM.settings$REM.Z.Trans[i] 
+    tmp.hakn <- REM.settings$REM.HAKN.Adjust[i]
+    
+    # ----------------------- Get relevant data ---------------------->
+    tmp.data <- tmp.shuff.metab.pred.results %>%
+      filter(Task.Dataset %in% studies.to.include) %>%
+      filter(Compound.Name == tmp.compound.name) %>%
+      left_join(datasets.summary %>% select(Dataset, N.subjects) %>% rename(Task.Dataset = Dataset), by = "Task.Dataset") %>%
+      mutate(N.Samples.Final = ifelse(N.subjects==-1, N.Train.Samples, N.subjects))
+      
+    # ------- Skip if not enough studies using these settings -------->
+    if (nrow(tmp.data) < min.num.of.studies.allowed) {return(NULL)}
+    
+    # ----------------- Calculate meta-analysis REM ------------------>
+    m.cor <- metacor(cor = Avg.Spearman, 
+                   n = N.Samples.Final, 
+                   data = tmp.data,
+                   studlab = tmp.data$Task.Dataset,
+                   sm = tmp.z, # Z-transformation options (COR/ZCOR)
+                   method.tau = tmp.method, # method to estimate the between-study variance 
+                   hakn = tmp.hakn, 
+                   comb.fixed = FALSE,
+                   comb.random = TRUE, 
+                   prediction = TRUE,
+                   title = paste(tmp.compound.name,"predictability"))
+    
+    # Fill columns in summarized result table
+    return(data.frame(HMDB = REM.settings$Task.HMDB[i],
+                      Compound.Name = tmp.compound.name,
+                      N.Datasets = nrow(tmp.data),
+                      Predictability.rho = FisherZInv(m.cor$TE.random),
+                      Pval.rho = m.cor$pval.random,
+                      I2 = m.cor$I2,
+                      stringsAsFactors = F))
+                          }
+  
+  # ---------------------- Apply FDR correction ---------------------->
+  tmp <- tmp %>%
+    mutate(FDR.rho = p.adjust(Pval.rho, method = "fdr")) %>%
+    mutate(Shuffle.id = shuff.id)
+    
+  REM.results.shuffled <- bind_rows(REM.results.shuffled, tmp)
+}
+print("DONE!")
+
+# ----------- Save to files (in order not to recompute) ------------>
+write.table(REM.results.shuffled, quote = FALSE, sep = "\t", 
+            file = '../data/REM_Results_Shuffled.tsv',
+            row.names = FALSE)
+
+# ---------------------------- Clean up ---------------------------->
+rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, min.num.of.studies.allowed)
+```
+
+```{r}
+# --------- Load shuffled REM results if it didn't just run ---------->
+if(!exists("REM.results.shuffled")) {
+  REM.results.shuffled <- read.delim('../data/REM_Results_Shuffled.tsv', stringsAsFactors = F)
+}
+
+print(paste(n_distinct(REM.results.shuffled$HMDB),"metabolites were analyzed with REMs"))
+
+REM.results.shuffled <- REM.results.shuffled %>%
+  mutate(Universal = FDR.rho < 0.1 & Predictability.rho > 0.3)
+
+REM.results.shuffled.summary <- REM.results.shuffled %>%
+  group_by(Shuffle.id) %>%
+  summarise(N = n(), N.Universal = sum(Universal), .groups = "drop")
+
+print("Results of shuffled version:")
+print("No. of robustly well-predicted metabolites:")
+print(paste("Average =",mean(REM.results.shuffled.summary$N.Universal)))
+print(paste("SD =",sd(REM.results.shuffled.summary$N.Universal)))
+quantile(x = REM.results.shuffled.summary$N.Universal, probs = c(0, 0.025, 0.5, 0.975, 1))
+print("P value of true number of universal metabolites (97):")
+print(sum(REM.results.shuffled.summary$N.Universal > 97)/1000)
+```
+
 ### Compare REM methods
 
 PI = Prediction Interval.  
@@ -1412,7 +1593,7 @@ print(paste0("Using a cutoff of FDR < ",
              " and spearman rho > ", 
              rho.threshold.REM,", ", 
              nrow(REM.universal), 
-             " metabolites are universally predictable by the microbiome."))
+             " metabolites are robustly predictable by the microbiome."))
 print(paste("Of these,", 
             nrow(REM.universal %>% filter(Non.Overlapping.PI)), 
             "also have a 95% prediction interval that is completely positive. Note: prediction intervals are only relevant for comparisons of >3 studies."))
@@ -1519,8 +1700,8 @@ main.val.table <- REM.results %>%
   filter(Tau.Method == selected.tau) %>%
   filter(Z.Transformation == selected.z) %>%
   mutate(Category = ifelse(HMDB %in% unique(REM.universal$HMDB),
-                           "Universally well-predicted",
-                           "Non-universally well-predicted")) %>%
+                           "Robustly well-predicted",
+                           "Non-robustly well-predicted")) %>%
   select(HMDB, N.Datasets, Category) %>%
   left_join(metabolite.stats, by = "HMDB") %>%
   left_join(metab.pred.results.sum %>%
@@ -1591,7 +1772,7 @@ ggplot(tmp, aes(x = Super.Class2, y = prop, fill = Category)) +
   geom_errorbar(aes(ymin=low, ymax=upper), width=.2, position=position_dodge(.9)) +
   annotate("rect", xmin = 1.75, xmax = 2.25, ymin = 51, ymax =51, alpha=1, colour = "black") +
   annotate(geom="text", x=2, y=52, label="*") +
-  ggtitle("Comparison of metabolite super-classes: universally well-predicted vs. others") +
+  ggtitle("Comparison of metabolite super-classes: robustly well-predicted vs. others") +
   theme_classic() + 
   scale_fill_manual(values = c("gray87","seagreen4")) +
   xlab(NULL) +
@@ -1659,7 +1840,7 @@ rm(franzosa.well.predicted.by.us, melonnpan.well.predicted, melonnpan.well.predi
 
 ### Zierer et al. (TwinsUK)
 
-Here we confirm that universally well-predicted metabolites have a larger proportion of their variance explained by the microbiome, as estimated by an independent study of the largest microbiome-metabolome dataset collected to date (twinsUK). See: *Zierer, Jonas, et al. "The fecal metabolome as a functional readout of the gut microbiome." Nature genetics 50.6 (2018): 790-795.*  
+Here we confirm that robustly well-predicted metabolites have a larger proportion of their variance explained by the microbiome, as estimated by an independent study of the largest microbiome-metabolome dataset collected to date (twinsUK). See: *Zierer, Jonas, et al. "The fecal metabolome as a functional readout of the gut microbiome." Nature genetics 50.6 (2018): 790-795.*  
 
 For this purpose we use a supplementary table from the paper, and mappings to HMDB ID's.
 
@@ -1688,7 +1869,7 @@ tmp <- REM.results %>%
   filter(Z.Transformation == selected.z) %>%
   select(HMDB, Predictability.rho) %>%
   inner_join(twinsUK.MM.var.explained %>% select(HMDB, var.explained), by = "HMDB") %>%
-  mutate(Universal = ifelse(HMDB %in% REM.universal$HMDB, "Universally\nwell-predicted", "Non-universally\nwell-predicted"))
+  mutate(Universal = ifelse(HMDB %in% REM.universal$HMDB, "Robustly\nwell-predicted", "Non-robustly\nwell-predicted"))
 
 # Continuous to binary
 (tmp2 <- wilcox.test(tmp$var.explained~tmp$Universal))
@@ -1700,7 +1881,7 @@ ggplot(tmp, aes(x=Universal, fill = Universal,
               position=position_jitter(0.2)) +
   scale_fill_manual(values = c("gray77","seagreen4")) +
   ylab("Metabolite variance explained by the microbiome\n(Zierer et al. 2019)") +
-  xlab(NULL) + #xlab("Universally well-predicted\nby the microbiome") +
+  xlab(NULL) + #xlab("Robustly well-predicted\nby the microbiome") +
   annotate("rect", ymin = 1.04, ymax = 1.04, xmin = 1, xmax = 2, alpha=1, colour = "black") +
   annotate(geom="text", y=1.06, x=1.5, label=get.signif.marks(tmp2$p.value)) +
   theme_classic() +

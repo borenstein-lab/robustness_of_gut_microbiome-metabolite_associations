@@ -1,10 +1,10 @@
 ---
-title: 'Analysis notebook: A meta-analysis study of the universality of gut microbiome-metabolome associations'
-date: "February 2021"
+title: 'Analysis notebook: A meta-analysis study of the robustness of gut microbiome-metabolome associations'
+date: "June 2021"
 output: html_document
 ---
 
-DOI: <TODO>
+This repository contains the analysis code for Muller et al, "A meta-analysis study of the robustness of gut microbiome-metabolome associations" (submitted).
 
 ### Abstract  
 
@@ -20,25 +20,25 @@ The scripts and files included in this repository are detailed below.
 
 ```
 root
-|-- code                              # all the scripts used for the analysis
-|   |-- Analysis_Notebook.Rmd         # main analysis script, includes all manuscript results and plots
-|   |-- Custom_Formatting.css         # notebook formatting
-|   |-- Utilities.R                   # utility functions for miscellaneous tasks
-|   |-- Subgroup_Meta-Analysis_Mixed_Effects.R  # functions for subgroup meta-analysis
-|   |-- Machine_Learning_Pipeline_For_Condor.R  # machine learning pipeline (meant to be used with HTCondor or another distributed job management system)
-|-- data                                # all the data used for the anlaysis including intermediate data
-|   |-- Processed_Data_29092020.RData   # processed microbiome-metabolome datasets from 10 studies
-|   |-- Combined_Metabolome_Predictability_Results.tsv                             # intermediate results from various machine learning pipelines per dataset per metabolite
-|   |-- REM_Results.tsv                 # a processed table with all REM model results
-|   |-- Full_REM_Results.RData          # raw REM model results
+|-- code                                # All the scripts used for the analysis
+|   |-- Analysis_Notebook.Rmd           # Main analysis script, includes all manuscript results and plots
+|   |-- Custom_Formatting.css           # Notebook formatting
+|   |-- Utilities.R                     # Utility functions for miscellaneous tasks
+|   |-- Machine_Learning_Pipeline_For_Condor.R  # Machine learning pipeline (meant to be used with HTCondor or another distributed job management system)
+|   |-- Subgroup_Meta-Analysis_Mixed_Effects.R  # Functions for subgroup meta-analysis
+|-- data                                # All the data used for the anlaysis including intermediate data
+|   |-- Processed_Data_29092020.RData   # Processed microbiome-metabolome datasets from 10 studies, loaded to R
+|   |-- Combined_Metabolome_Predictability_Results.zip                             # Intermediate results from various machine learning pipelines, per dataset per metabolite (should be unzipped before running)
+|   |-- REM_Results.tsv                 # A processed table with all REM model results
+|   |-- Full_REM_Results.RData          # Raw REM model results
 |   |-- MelonnPan_supp_table_3_withHMDB.xlsx   # Table related to Mallick et al. 2019
-|   |-- Zierer_et_al_2018               # files related to Zierer et al. 2018 
-|   |-- Subgroup_REM_Results.tsv        # a processed table with all subgroup-REM model results
-|   |-- Full_Subgroup_REM_Results.RData # raw subgroup-REM model results
-|   |-- Permutation_Feature_Importances.tsv
-|   |-- Pairwise_Contrib_Results.tsv
-|   |-- Pairwise_Cross_Pred_Results.tsv
-|   |-- Pairwise_Cross_Pred_Results_Healthy_Disease.tsv
+|   |-- Zierer_et_al_2018               # Files related to Zierer et al. 2018 
+|   |-- Subgroup_REM_Results.tsv        # A processed table with all subgroup-REM model results
+|   |-- Full_Subgroup_REM_Results.RData # Raw subgroup-REM model results
+|   |-- Permutation_Feature_Importances.tsv # Raw feature-importance analysis results
+|   |-- Pairwise_Contrib_Results.tsv    # Raw feature-importance analysis results for pairwise studies comparisons
+|   |-- Pairwise_Cross_Pred_Results.tsv # Raw cross-predictability results for pairwise studies comparisons
+|   |-- Pairwise_Cross_Pred_Results_Healthy_Disease.tsv # Raw cross-predictability results for healthy vs. disease analysis
 |-- README.md
 ```
 
