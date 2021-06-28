@@ -1,10 +1,6 @@
----
-title: 'Analysis notebook: A meta-analysis study of the robustness of gut microbiome-metabolome associations'
-date: "June 2021"
-output: html_document
----
+This repository contains the analysis code for Muller et al, "A meta-analysis study of the robustness of gut microbiome-metabolome associations".
 
-This repository contains the analysis code for Muller et al, "A meta-analysis study of the robustness of gut microbiome-metabolome associations" (submitted).
+Citation: to be completed.
 
 ### Abstract  
 
