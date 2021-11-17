@@ -1,6 +1,6 @@
 This repository contains the analysis code for Muller et al, "A meta-analysis study of the robustness of gut microbiome-metabolome associations".
 
-Citation: to be completed.
+Citation: Muller, E., Algavi, Y.M. & Borenstein, E. A meta-analysis study of the robustness and universality of gut microbiome-metabolome associations. Microbiome 9, 203 (2021). https://doi.org/10.1186/s40168-021-01149-z
 
 ### Abstract  
 
