@@ -9,7 +9,7 @@
 # The script is meant to be used with a job management system such as HTCondor.
 
 # The script requires the following arguments:
-#  (1) Rdata object with all needed data / functions / variables
+#  (1) Rdata object with all needed data / functions / variables (as created by the main R notebook, "Analysis_Notebook.Rmd")
 #  (2) dataset name
 #  (3) model type (out of: RF, ENet)
 #  (4) runs per task

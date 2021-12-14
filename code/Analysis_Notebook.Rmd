@@ -60,6 +60,26 @@ ggplot2::theme_set(theme_light())
 knitr::opts_chunk$set(fig.align = 'center', cache=TRUE)
 ```
 
+Paths:
+
+```{r}
+PATH_PROCESSED_DATA <- '../data/Processed_Data_Backup_29092020.RData'
+PATH_METAB_PREDICT_RESULTS <- '../data/Combined_Metabolome_Predictability_Results.tsv'
+PATH_REM_RESULTS <- '../data/REM_Results.tsv'
+PATH_REM_MODELS <- '../data/Full_REM_Results.RData'
+PATH_REM_RESULTS_SHUF <- '../data/REM_Results_Shuffled.tsv'
+PATH_MELONNPAN_RESULTS <- '../data/MelonnPan_supp_table_3_withHMDB.xlsx'
+PATH_ZIERER_METAB_MAP <- '../data/Zierer_et_al_2018/Metabolite_HMDB_Mappings.tsv'
+PATH_ZIERER_RESULTS <- '../data/Zierer_et_al_2018/Variance components and phenotype associations of fecal metabolites.xlsx'
+PATH_REM_SUBGROUPS <- '../data/Subgroup_REM_Results.tsv'
+PATH_REM_SUBGROUP_MODELS <- '../data/Full_Subgroup_REM_Results.RData'
+PATH_PERM_FEATURE_IMP <- '../data/Permutation_Feature_Importances.tsv'
+PATH_PAIRWISE_CROSS_PRED <- '../data/Pairwise_Cross_Pred_Results.tsv'
+PATH_PAIRWISE_CONTRIBS <- '../data/Pairwise_Contrib_Results.tsv'
+PATH_PAIRWISE_CROSS_PRED_D <- '../data/Pairwise_Cross_Pred_Results_Healthy_Disease.tsv'
+```
+
+
 ## 1. Load data
 
 In this section we load the data from an RData file, downsample temporal datasets, and print some statistics.  
@@ -74,7 +94,7 @@ The RData file includes:
 Notes about data processing are available in the manuscript's supplementary information.
 
 ```{r LOAD_DATA}
-load("../data/Processed_Data_Backup_29092020.RData")
+load(PATH_PROCESSED_DATA)
 message("Data loaded")
 ```
 
@@ -514,8 +534,8 @@ Each line in the table represents a specific set of pipeline settings, a specifi
 
 ```{r ORGANIZE_RESULTS, message = FALSE}
 # Read if not exists already
-metab.pred.results <- read_delim("../data/Combined_Metabolome_Predictability_Results.tsv", 
-                                   "\t", escape_double = FALSE, trim_ws = TRUE)
+metab.pred.results <- read_delim(PATH_METAB_PREDICT_RESULTS, 
+                                 "\t", escape_double = FALSE, trim_ws = TRUE)
 metab.pred.results <- metab.pred.results %>% 
     filter(PipeSettings.Genera.Trans == "RELATIVE")
 
@@ -901,6 +921,8 @@ print(paste("Moreover,", sum(pred.per.metabolite$Count.Well.Predicted > 1),
 ```
 
 #### Compare to a shuffled version
+
+TODO: save to a file to avoid re-computing each notebook run.
 
 ```{r}
 pred.per.metabolite.shuff <- data.frame(stringsAsFactors = F)
@@ -1398,9 +1420,8 @@ rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, min.num.of.studies.allow
 ```{r}
 # --------- Load REM results if it didn't just run ---------->
 if(!exists("REM.results")) {
-  REM.results <- read.delim('../data/REM_Results.tsv', 
-                            stringsAsFactors = F)
-  load('../data/Full_REM_Results.RData')
+  REM.results <- read.delim(PATH_REM_RESULTS, stringsAsFactors = F)
+  load(PATH_REM_MODELS)
 }
 
 print(paste(n_distinct(REM.results$HMDB),"metabolites were analyzed with REMs"))
@@ -1505,7 +1526,7 @@ rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, min.num.of.studies.allow
 ```{r}
 # --------- Load shuffled REM results if it didn't just run ---------->
 if(!exists("REM.results.shuffled")) {
-  REM.results.shuffled <- read.delim('../data/REM_Results_Shuffled.tsv', stringsAsFactors = F)
+  REM.results.shuffled <- read.delim(PATH_REM_RESULTS_SHUF, stringsAsFactors = F)
 }
 
 print(paste(n_distinct(REM.results.shuffled$HMDB),"metabolites were analyzed with REMs"))
@@ -1802,8 +1823,7 @@ franzosa.well.predicted.by.us <- metab.pred.results.sum %>%
   filter(Task.Dataset == "FRANZOSA_IBD_HEALTHY") %>% 
   rename(HMDB = Task.HMDB)
 
-melonnpan.well.predicted <- read.xls("../data/MelonnPan_supp_table_3_withHMDB.xlsx", 
-                                       sheet=1, skip=1, header=TRUE)
+melonnpan.well.predicted <- read.xls(PATH_MELONNPAN_RESULTS, sheet=1, skip=1, header=TRUE)
 
 melonnpan.well.predicted.2 <- melonnpan.well.predicted %>%
   left_join(franzosa.well.predicted.by.us, by = "HMDB") %>%
@@ -1845,10 +1865,8 @@ Here we confirm that robustly well-predicted metabolites have a larger proportio
 For this purpose we use a supplementary table from the paper, and mappings to HMDB ID's.
 
 ```{r TWINSUK_VALIDATION_VAR_EXPLAINED}
-twinsUK.metab.mappings <- read_delim("../data/Zierer_et_al_2018/Metabolite_HMDB_Mappings.tsv", 
-                                       "\t", escape_double = FALSE, trim_ws = TRUE)
-twinsUK.MM.var.explained <- read.xls("../data/Zierer_et_al_2018/Variance components and phenotype associations of fecal metabolites.xlsx", 
-                                       sheet=1, skip=1, header=TRUE)
+twinsUK.metab.mappings <- read_delim(PATH_ZIERER_METAB_MAP, "\t", escape_double = FALSE, trim_ws = TRUE)
+twinsUK.MM.var.explained <- read.xls(PATH_ZIERER_RESULTS, sheet=1, skip=1, header=TRUE)
 
 twinsUK.MM.var.explained <- twinsUK.MM.var.explained %>%
   select(ID, Metabolite, M, p) %>%
@@ -2049,8 +2067,8 @@ rm(i, tmp.compound.name, m.cor, tmp.data, REM.settings, keep.these, tmp.method, 
 ```{r REM_SUBGROUP_ORGANIZE}
 # --------- Load REM results if it didn't just run ---------->
 if(!exists("REM.subgroup.results")) {
-  REM.subgroup.results <- read.delim('../data/Subgroup_REM_Results.tsv', stringsAsFactors = F)
-  load('../data/Full_Subgroup_REM_Results.RData')
+  REM.subgroup.results <- read.delim(PATH_REM_SUBGROUPS, stringsAsFactors = F)
+  load(PATH_REM_SUBGROUP_MODELS)
 }
 
 print(paste(n_distinct(REM.subgroup.results$HMDB),"metabolites were analyzed in the subgroup REM analysis"))
@@ -2284,7 +2302,7 @@ rm(dataset, i, metabolite, genera.trans.choice, dt, metab.vector, model.choice, 
 Load results.  
 
 ```{r message = FALSE}
-metab.contributors.Perm <- read_delim("../data/Permutation_Feature_Importances.tsv", 
+metab.contributors.Perm <- read_delim(PATH_PERM_FEATURE_IMP, 
     "\t", escape_double = FALSE, trim_ws = TRUE)
 
 # If results include datasets no longer relevant, remove them now
@@ -2543,11 +2561,11 @@ rm(tmp.hmdb, tmp.metab.name, relevant.datasets, flag.re.normalize, flag.down.sam
 #### Organize results
 
 ```{r LOAD_PAIRWISE_H_CONTRIBS_CROSS_PREDS, warning=FALSE, message=FALSE}
-pairwise.comp.cross.pred <- read_delim("../data/Pairwise_Cross_Pred_Results.tsv", 
+pairwise.comp.cross.pred <- read_delim(PATH_PAIRWISE_CROSS_PRED, 
     "\t", escape_double = FALSE, trim_ws = TRUE)
 
 # (Without downsampling)
-pairwise.comp.contribs <- read_delim("../data/Pairwise_Contrib_Results.tsv", 
+pairwise.comp.contribs <- read_delim(PATH_PAIRWISE_CONTRIBS, 
     "\t", escape_double = FALSE, trim_ws = TRUE)
 
 # If results include datasets no longer relevant, remove them now
@@ -2874,7 +2892,7 @@ In the cross-prediction matrix, empty cells mean that the trained model after do
 all.cp.plots <- list()
 all.fic.plots <- list()
 
-for(tmp.metab.name in levels(feat.importance.stats$Compound.Name)) { # tmp.metab.name = "Taurine"
+for(tmp.metab.name in levels(feat.importance.stats$Compound.Name)) { # tmp.metab.name = "Cholic acid"
   tmp.hmdb <- metabolite.stats$HMDB[metabolite.stats$Compound.Name == tmp.metab.name]
   
   # Get list of features to include in plot
@@ -2918,15 +2936,28 @@ for(tmp.metab.name in levels(feat.importance.stats$Compound.Name)) { # tmp.metab
     mutate(Significance.cp2 = get.signif.marks(New.Spearman.fdr.cp2)) %>%
     select(Dataset1, Dataset2, 
            New.Spearman.rho.cp2, New.Spearman.fdr.cp2, 
-           Significance.cp2, Well.Transferred) %>%
+           Significance.cp2, Well.Transferred) 
+  
+  # Add a label for the CP plots (CP = Cross-predictability)
+  # We add a newline for cases where text won't fit in square
+  tmp <- tmp %>%
     mutate(p.label.cp = ifelse(is.na(New.Spearman.rho.cp2), 
                                "", 
-                               paste("CP:\n",round(New.Spearman.rho.cp2,2), 
-                                     Significance.cp2)))  # CP = Cross-predictability
+                               round(New.Spearman.rho.cp2,2))) %>%
+    mutate(p.label.cp = ifelse(Significance.cp2 == "",
+                               p.label.cp,
+                               paste(p.label.cp, Significance.cp2))) %>%
+    rowwise() %>% 
+    mutate(p.label.cp = ifelse(n_distinct(tmp$Dataset1)>3,
+                               gsub(" ","\n",p.label.cp),
+                               p.label.cp))
     
   p3 <- ggplot(tmp, aes(x = Dataset1, y = Dataset2, fill = Well.Transferred)) + 
     geom_tile(color = "black") + 
-    geom_text(aes(label=p.label.cp), size = 2) +
+    geom_text(aes(label=p.label.cp), 
+              size = ifelse(n_distinct(tmp$Dataset1)>5,
+                            2.3,
+                            ifelse(n_distinct(tmp$Dataset1)>4,2.4,2.5))) +
     geom_abline(slope = -1, intercept = length(ds.ordering)+1) +
     xlab("Trained on") + 
     ylab("Tested on") + 
@@ -2940,7 +2971,6 @@ for(tmp.metab.name in levels(feat.importance.stats$Compound.Name)) { # tmp.metab
           axis.text.y = element_text(size = 9),
           axis.title = element_text(size = 9),
           legend.position = "none", #"top",
-          #legend.text = element_text(size=6),
           plot.title = element_text(hjust=0.5, size = 10),
           plot.margin = unit(c(0,0,0.1,-0.07), "cm"))
   all.cp.plots[[tmp.metab.name]] <- p3 
@@ -2992,9 +3022,35 @@ rm(tmp.hmdb, tmp.metab.name, features.to.include,
 
 #### CP plots
 
-```{r fig.width=13, fig.height=17}
+```{r fig.width=13, fig.height=17, eval=F}
 do.call("grid.arrange", c(all.cp.plots, ncol=6))
 ```
+
+Specific plots for manuscript:
+
+```{r fig.width=1.9, fig.height=2.2}
+p <- all.cp.plots$`beta-Alanine`
+print(p)
+
+p <- all.cp.plots$`Sebacic acid`
+print(p)
+
+p <- all.cp.plots$`L-Tyrosine`
+print(p)
+
+p <- all.cp.plots$Taurine
+print(p)
+
+p <- all.cp.plots$`N-Acetylputrescine`
+print(p)
+
+p <- all.cp.plots$Xanthine
+print(p)
+
+p <- all.cp.plots$`Cholic acid`
+print(p)
+```
+
 
 #### FIC plots
 
@@ -3241,7 +3297,7 @@ Load results, verify the number of analyzed metabolites is as expected.
 We remove all cases where the healthy model was no longer well-predicting the metabolite (this happened in cases where the control group was larger than the case group and was therefor downsampled).
 
 ```{r LOAD_PAIRWISE_H_VS_D_CONTRIBS_CROSS_PREDS, warning=FALSE, message=FALSE}
-pairwise.cp.h.vs.d.raw <- read_delim("../data/Pairwise_Cross_Pred_Results_Healthy_Disease.tsv", 
+pairwise.cp.h.vs.d.raw <- read_delim(PATH_PAIRWISE_CROSS_PRED_D, 
     "\t", escape_double = FALSE, trim_ws = TRUE)
 
 pairwise.cp.h.vs.d <- pairwise.cp.h.vs.d.raw %>%
